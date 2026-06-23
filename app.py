@@ -19,6 +19,81 @@ import numpy as np
 import cv2
 import streamlit as st
 
+# --- streamlit-image-coordinates (опционально: нужен для клика по изображению) ---
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates as _st_imgcoords
+    HAS_IMGCOORDS = True
+except Exception:
+    _st_imgcoords = None
+    HAS_IMGCOORDS = False
+
+# --- session state для вкладки Включения -----------------------------------
+def _ss_init():
+    defaults = {
+        "incl_pts":        [],    # [(x,y),...] — счётчик включений
+        "diam_pairs":      [],    # [((x1,y1),(x2,y2)),...] — пары замера диаметра
+        "diam_pending":    None,  # первая точка пары (ожидает вторую)
+        "click_calib_pts": [],    # [(x,y),(x,y)] — калибровка по 2 кликам
+        "incl_src":        None,  # имя файла; при смене сбрасываем точки
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+_ss_init()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Вспомогательные функции вкладки «Включения» (до st.stop!)
+# ════════════════════════════════════════════════════════════════════
+
+def _dist(p1, p2):
+    """Евклидово расстояние между двумя пикселями."""
+    return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+
+
+def _draw_incl_overlay(bgr, pts, diam_pairs, diam_pending, calib_pts, px_mm):
+    """Рисует маркеры включений, отрезки диаметра и точки калибровки на RGB-оверлее."""
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).copy()
+    for i, (x, y) in enumerate(pts):
+        cv2.circle(rgb, (x, y), 7, (220, 50, 50), 2)
+        cv2.putText(rgb, str(i + 1), (x + 9, y - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 50, 50), 1, cv2.LINE_AA)
+    for (p1, p2) in diam_pairs:
+        cv2.line(rgb, p1, p2, (50, 200, 80), 2)
+        d_px = _dist(p1, p2)
+        label = f"{d_px:.0f}px"
+        if px_mm and px_mm > 0:
+            label += f" / {d_px / px_mm:.2f}mm"
+        mx, my = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
+        cv2.putText(rgb, label, (mx - 20, my - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (30, 160, 60), 1, cv2.LINE_AA)
+    if diam_pending:
+        cv2.drawMarker(rgb, diam_pending, (50, 200, 80), cv2.MARKER_CROSS, 14, 2)
+    for i, (x, y) in enumerate(calib_pts):
+        cv2.circle(rgb, (x, y), 8, (255, 165, 0), 2)
+        cv2.putText(rgb, f"C{i+1}", (x + 9, y - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 140, 0), 1, cv2.LINE_AA)
+    if len(calib_pts) == 2:
+        cv2.line(rgb, calib_pts[0], calib_pts[1], (255, 165, 0), 1)
+    return rgb
+
+
+def _inclusion_mask(gray_img, dark_k=2.0, min_area=4):
+    """Классическая маска тёмных включений: адаптивный порог + морфология."""
+    blur   = cv2.GaussianBlur(gray_img, (15, 15), 0)
+    diff   = blur.astype(np.int16) - gray_img.astype(np.int16)
+    thr    = max(5.0, float(np.mean(diff)) + dark_k * float(np.std(diff)))
+    mask   = (diff >= thr).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    clean  = np.zeros_like(mask)
+    for lbl in range(1, n_lab):
+        if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
+            clean[labels == lbl] = 255
+    return clean
+
+
 # --- matplotlib опционален -------------------------------------------------
 try:
     import matplotlib
@@ -1257,11 +1332,29 @@ def img_to_png_bytes(rgb: np.ndarray) -> bytes:
     return buf.tobytes() if ok else b""
 
 
+class _NpEncoder(json.JSONEncoder):
+    """Конвертирует numpy-скаляры (float32, int64 и т.д.) в стандартные Python-типы."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+def _safe_json(d) -> str:
+    return json.dumps(d, ensure_ascii=False, indent=2, cls=_NpEncoder)
+
 def metrics_csv(d: dict) -> str:
     lines = ["key,value"]
     for k, v in d.items():
         if isinstance(v, dict):
             continue
+        if isinstance(v, np.integer):
+            v = int(v)
+        elif isinstance(v, np.floating):
+            v = float(v)
         lines.append(f"{k},{v}")
     return "\n".join(lines)
 
@@ -1327,11 +1420,14 @@ st.sidebar.divider()
 st.sidebar.caption("Классический грейд — авторитетный. ML-надстройки нет.")
 
 
+
 # ════════════════════════════════════════════════════════════════════
 #  Tabs
 # ════════════════════════════════════════════════════════════════════
 
-tab_seg, tab_gen, tab_help = st.tabs(["🩻 Осевая сегрегация", "🧩 Другие дефекты", "ℹ️ Справка"])
+tab_seg, tab_gen, tab_incl, tab_help = st.tabs(
+    ["🩻 Осевая сегрегация", "🧩 Другие дефекты", "🔬 Включения", "ℹ️ Справка"]
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1412,7 +1508,7 @@ with tab_seg:
     payload = res.to_json_dict()
     payload["source"] = src_name
     payload["working_size"] = [W, H]
-    dl1.download_button("⬇️ JSON", json.dumps(payload, ensure_ascii=False, indent=2),
+    dl1.download_button("⬇️ JSON", _safe_json(payload),
                         file_name=f"centerline_{Path(src_name).stem}.json", mime="application/json")
     dl2.download_button("⬇️ CSV", metrics_csv(payload),
                         file_name=f"centerline_{Path(src_name).stem}.csv", mime="text/csv")
@@ -1492,7 +1588,7 @@ with tab_gen:
     gp["roi_xywh"] = list(roi_xywh)
     gp["auto_trace"] = trace
     gd1, gd2 = st.columns(2)
-    gd1.download_button("⬇️ JSON", json.dumps(gp, ensure_ascii=False, indent=2),
+    gd1.download_button("⬇️ JSON", _safe_json(gp),
                         file_name=f"defect_{Path(src_name).stem}.json", mime="application/json")
     gd2.download_button("⬇️ CSV", metrics_csv(gp),
                         file_name=f"defect_{Path(src_name).stem}.csv", mime="text/csv")
@@ -1501,6 +1597,200 @@ with tab_gen:
 # ─────────────────────────────────────────────────────────────────────
 #  TAB 3 — Help
 # ─────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────
+#  TAB 3 — Inclusion counter + diameter measurement + click calibration
+# ─────────────────────────────────────────────────────────────────────
+with tab_incl:
+    st.subheader("🔬 Включения — счётчик и замер")
+
+    # --- при смене файла — сбрасываем все точки -------------------------
+    if st.session_state.get("incl_src") != src_name:
+        st.session_state.incl_pts        = []
+        st.session_state.diam_pairs      = []
+        st.session_state.diam_pending    = None
+        st.session_state.click_calib_pts = []
+        st.session_state.incl_src        = src_name
+
+    # --- режим ----------------------------------------------------------
+    incl_mode = st.radio(
+        "Режим", ["Счёт включений", "Замер диаметра", "Калибровка 2 клика"],
+        horizontal=True, key="incl_mode_radio"
+    )
+
+    # --- клик по изображению -------------------------------------------
+    if not HAS_IMGCOORDS:
+        st.warning("📦 Установите `streamlit-image-coordinates` для кликов на изображении:\n"
+                   "в Shell → `pip install streamlit-image-coordinates`  "
+                   "и добавьте в `requirements.txt`.")
+
+    overlay_rgb = _draw_incl_overlay(
+        work,
+        st.session_state.incl_pts,
+        st.session_state.diam_pairs,
+        st.session_state.diam_pending,
+        st.session_state.click_calib_pts,
+        px_per_mm,
+    )
+
+    hint_map = {
+        "Счёт включений":    "👆 Нажмите на включение — оно добавится в счётчик",
+        "Замер диаметра":    "👆 Клик 1 — начало диаметра  ·  Клик 2 — конец",
+        "Калибровка 2 клика": "👆 Кликните две точки с известным расстоянием",
+    }
+    st.caption(hint_map[incl_mode])
+
+    if HAS_IMGCOORDS:
+        # streamlit-image-coordinates принимает PIL Image или URL
+        from PIL import Image as _PILImage
+        pil_img = _PILImage.fromarray(overlay_rgb)
+        clicked = _st_imgcoords(pil_img, key=f"incl_click_{incl_mode}_{src_name}")
+    else:
+        st.image(overlay_rgb, use_container_width=True)
+        clicked = None
+
+    # --- обработка клика -----------------------------------------------
+    if clicked is not None:
+        cx, cy = int(clicked["x"]), int(clicked["y"])
+        # координаты могут быть в пространстве PIL-изображения (= work), масштаб 1:1
+        if incl_mode == "Счёт включений":
+            st.session_state.incl_pts.append((cx, cy))
+            st.rerun()
+        elif incl_mode == "Замер диаметра":
+            if st.session_state.diam_pending is None:
+                st.session_state.diam_pending = (cx, cy)
+            else:
+                p1 = st.session_state.diam_pending
+                st.session_state.diam_pairs.append((p1, (cx, cy)))
+                st.session_state.diam_pending = None
+            st.rerun()
+        elif incl_mode == "Калибровка 2 клика":
+            pts = st.session_state.click_calib_pts
+            if len(pts) < 2:
+                pts.append((cx, cy))
+            else:
+                st.session_state.click_calib_pts = [(cx, cy)]
+            st.rerun()
+
+    # --- панель результатов --------------------------------------------
+    res_col, mask_col = st.columns([1, 1])
+
+    with res_col:
+        # Счёт включений
+        st.markdown("**Включения**")
+        n_incl = len(st.session_state.incl_pts)
+        st.metric("Кол-во включений", n_incl)
+        if n_incl:
+            rows = []
+            for i, (x, y) in enumerate(st.session_state.incl_pts):
+                rows.append(f"{i+1}. x={x} y={y}")
+            st.text("\n".join(rows))
+        if st.button("🗑 Очистить включения"):
+            st.session_state.incl_pts = []
+            st.rerun()
+
+        st.divider()
+
+        # Диаметры
+        st.markdown("**Замеры диаметра**")
+        if st.session_state.diam_pending:
+            st.caption(f"⏳ Ожидаю вторую точку... (первая: {st.session_state.diam_pending})")
+        diam_results = []
+        for i, (p1, p2) in enumerate(st.session_state.diam_pairs):
+            d_px = _dist(p1, p2)
+            d_mm = round(d_px / px_per_mm, 3) if (px_per_mm and px_per_mm > 0) else None
+            diam_results.append({
+                "n": i + 1, "x1": p1[0], "y1": p1[1],
+                "x2": p2[0], "y2": p2[1],
+                "diameter_px": round(d_px, 1),
+                "diameter_mm": d_mm,
+            })
+            mm_str = f" = {d_mm} мм" if d_mm else ""
+            st.caption(f"{i+1}. {d_px:.1f} px{mm_str}")
+        if diam_results and st.button("🗑 Очистить диаметры"):
+            st.session_state.diam_pairs = []
+            st.session_state.diam_pending = None
+            st.rerun()
+
+        st.divider()
+
+        # Калибровка кликом
+        st.markdown("**Калибровка 2 кликами**")
+        calib_pts = st.session_state.click_calib_pts
+        if len(calib_pts) == 2:
+            d_calib_px = _dist(calib_pts[0], calib_pts[1])
+            real_mm_click = st.number_input(
+                "Реальное расстояние, мм", min_value=0.1, value=50.0, step=1.0,
+                key="click_calib_mm"
+            )
+            if d_calib_px > 1e-6 and real_mm_click > 0:
+                ppm_click = d_calib_px / real_mm_click
+                st.success(f"→ **{ppm_click:.3f} px/mm**  "
+                           f"(расстояние {d_calib_px:.1f} px = {real_mm_click} мм)\n\n"
+                           "Скопируйте это значение в боковую панель → «Прямой px/mm»")
+        elif len(calib_pts) == 1:
+            st.caption(f"Точка 1: {calib_pts[0]} — кликните вторую точку")
+        else:
+            st.caption("Кликните две точки с известным расстоянием")
+        if calib_pts and st.button("🗑 Сбросить калибровку"):
+            st.session_state.click_calib_pts = []
+            st.rerun()
+
+    with mask_col:
+        # Классическая маска включений
+        st.markdown("**Маска тёмных включений**")
+        dark_k_m = st.slider("Чувствительность (dark_k)", 0.5, 5.0, 2.0, 0.1,
+                             key="incl_mask_k",
+                             help="Больше = строже (меньше шума); меньше = мягче (больше включений)")
+        min_area_m = st.slider("Мин. площадь, px²", 1, 50, 4, 1, key="incl_mask_area")
+        incl_mask = _inclusion_mask(gray, dark_k=dark_k_m, min_area=min_area_m)
+        # наложение маски на изображение (красный оверлей)
+        mask_overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB).copy()
+        mask_overlay[incl_mask > 0] = [200, 50, 50]
+        st.image(np.hstack([
+            cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB),
+            mask_overlay,
+        ]), caption="Слева: оригинал · Справа: маска (красный)", use_container_width=True)
+
+        # статистика маски
+        n_lab_m, _, stats_m, _ = cv2.connectedComponentsWithStats(incl_mask, connectivity=8)
+        n_objects = n_lab_m - 1
+        areas = [int(stats_m[l, cv2.CC_STAT_AREA]) for l in range(1, n_lab_m)]
+        mask_stats = {
+            "n_dark_objects": n_objects,
+            "total_dark_px": int(np.sum(incl_mask > 0)),
+            "dark_area_frac": round(float(np.mean(incl_mask > 0)), 5),
+            "max_object_area_px": int(max(areas)) if areas else 0,
+            "mean_object_area_px": round(float(np.mean(areas)), 1) if areas else 0.0,
+        }
+        if px_per_mm and px_per_mm > 0:
+            mask_stats["max_object_diam_mm"] = round(
+                (mask_stats["max_object_area_px"] ** 0.5) / px_per_mm, 3)
+        st.json(mask_stats)
+
+        # скачать маску PNG
+        ok_m, buf_m = cv2.imencode(".png", incl_mask)
+        if ok_m:
+            st.download_button("⬇️ Маска PNG", buf_m.tobytes(),
+                               file_name=f"inclusion_mask_{Path(src_name).stem}.png",
+                               mime="image/png")
+
+    st.divider()
+    # JSON-экспорт всех данных вкладки
+    export_incl = {
+        "source": src_name,
+        "working_size_px": [W, H],
+        "px_per_mm": px_per_mm,
+        "inclusions": [{"n": i+1, "x": x, "y": y} for i, (x, y) in enumerate(st.session_state.incl_pts)],
+        "n_inclusions": len(st.session_state.incl_pts),
+        "diameters": diam_results if 'diam_results' in dir() else [],
+        "mask": mask_stats if 'mask_stats' in dir() else {},
+    }
+    st.download_button("⬇️ Все данные JSON", _safe_json(export_incl),
+                       file_name=f"inclusions_{Path(src_name).stem}.json",
+                       mime="application/json")
+
+
 with tab_help:
     st.subheader("Как пользоваться")
     st.markdown(
