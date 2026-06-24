@@ -46,7 +46,7 @@ ORANGE = (255, 150, 0)
 RED = (220, 50, 50)
 BLACK = (20, 20, 20)
 
-APP_VERSION = "app334-mobile-hotfix-v2-2026-06-24"
+APP_VERSION = "app334-mobile-hotfix-v4-2026-06-24-big-click-canvas"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -73,7 +73,9 @@ def _init_state() -> None:
         "stored_image_name": None,
         "stored_image_id": None,
         "stored_image_source": None,
-        "force_static_preview": True,
+        "force_static_preview": False,
+        "show_control_preview_v4": False,
+        "canvas_display_width": 720,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -893,34 +895,76 @@ overlay = draw_overlay(
     mode,
 )
 
-st.session_state.force_static_preview = st.checkbox(
-    "Показать обычное изображение над кликабельным холстом",
-    value=bool(st.session_state.force_static_preview),
-    help="Оставьте включённым на телефоне. Верхняя картинка просто показывает, что файл прочитан. Клики работают на интерактивном изображении ниже.",
+# В v4 большая картинка — это именно кликабельный canvas.
+# Контрольную st.image оставляем только как дополнительную проверку, чтобы не путать её с полотном замеров.
+if fullscreen:
+    max_canvas_width = min(1200, max(360, int(W * 3)))
+    default_canvas_width = min(760, max(360, int(W * 2)))
+    canvas_display_width = st.slider(
+        "Ширина кликабельного полотна на экране, px",
+        min_value=280,
+        max_value=max_canvas_width,
+        value=int(st.session_state.get("canvas_display_width", default_canvas_width)) if 280 <= int(st.session_state.get("canvas_display_width", default_canvas_width)) <= max_canvas_width else default_canvas_width,
+        step=20,
+        help="Это только экранный размер кликабельного полотна. Расчёты остаются в рабочих пикселях изображения. Если на телефоне холст пропал — уменьшите до 360–520 px.",
+        key="canvas_display_width",
+    )
+else:
+    canvas_display_width = W
+
+show_control_preview = st.checkbox(
+    "Показать некликабельную контрольную картинку",
+    value=bool(st.session_state.get("show_control_preview_v4", False)),
+    key="show_control_preview_v4",
+    help="Это только проверочная картинка. Для замеров кликайте по большому кликабельному полотну ниже.",
 )
 
 if HAS_CLICK:
-    # Важно: width=W. Так координаты компонента совпадают с рабочими пикселями изображения.
-    # Если на телефоне холст не появляется, уменьшите "Рабочую ширину" до 360–620 px.
-    if st.session_state.force_static_preview:
-        st.image(overlay, caption="Проверка: изображение прочитано и отрисовано. Для замера кликайте по изображению ниже.", use_container_width=True)
-    st.caption("Кликабельное изображение для замеров ниже. Если его не видно — уменьшите рабочую ширину до 280–360 px и обновите страницу.")
+    if show_control_preview:
+        st.image(
+            overlay,
+            caption="Контрольная картинка: она НЕ принимает клики. Для замера кликайте по полотну ниже.",
+            use_container_width=True,
+        )
+
+    # Делаем отдельную экранную копию canvas.
+    # Это позволяет показать большое кликабельное изображение, но координаты затем
+    # возвращать обратно в рабочую систему W×H.
+    canvas_scale = max(1e-9, float(canvas_display_width) / float(W))
+    canvas_h = max(1, int(round(H * canvas_scale)))
+    if int(canvas_display_width) != W:
+        canvas_overlay = cv2.resize(overlay, (int(canvas_display_width), canvas_h), interpolation=cv2.INTER_LINEAR)
+    else:
+        canvas_overlay = overlay
+
+    st.caption(
+        "Кликабельное полотно для замеров. Большая контрольная картинка выше, если включена, клики не принимает."
+    )
     val = st_imgcoords(
-        PILImage.fromarray(overlay),
-        width=W,
-        key=f"canvas_{image_state_key}_{mode}",
+        PILImage.fromarray(canvas_overlay),
+        width=int(canvas_display_width),
+        key=f"canvas_v4_{image_state_key}_{mode}_{int(canvas_display_width)}",
     )
     if debug:
         st.write({
             "component_value": val,
+            "work_size": [W, H],
+            "canvas_size": [int(canvas_display_width), canvas_h],
+            "canvas_scale": canvas_scale,
             "pending": st.session_state.pending,
             "calib_pts": st.session_state.calib_pts,
             "last_click_id": st.session_state.last_click_id,
         })
     if val is not None and "x" in val and "y" in val:
-        x, y = clamp_click(int(round(val["x"])), int(round(val["y"])), W, H)
+        # streamlit-image-coordinates отдаёт координаты клика по отрисованному canvas.
+        # Переводим их в рабочие пиксели исходной уменьшенной картинки.
+        raw_x = float(val["x"])
+        raw_y = float(val["y"])
+        x = int(round(raw_x / canvas_scale))
+        y = int(round(raw_y / canvas_scale))
+        x, y = clamp_click(x, y, W, H)
         event_time = val.get("timestamp", val.get("time", val.get("event_time", "")))
-        click_id = f"{image_state_key}:{mode}:{x}:{y}:{event_time}"
+        click_id = f"{image_state_key}:{mode}:{x}:{y}:{event_time}:{int(canvas_display_width)}"
         if click_id != st.session_state.last_click_id:
             st.session_state.last_click_id = click_id
             handle_click(x, y, mode)
