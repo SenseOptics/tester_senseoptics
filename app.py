@@ -45,6 +45,7 @@ BLUE = (40, 120, 230)
 ORANGE = (255, 150, 0)
 RED = (220, 50, 50)
 BLACK = (20, 20, 20)
+APP_VERSION = "app334 clean no-sidebar upload/fullscreen v2 — 2026-06-24"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -100,8 +101,10 @@ _init_state()
 st.markdown(
     """
 <style>
-    section[data-testid="stSidebar"] {display: none !important;}
-    [data-testid="collapsedControl"] {display: none !important;}
+    section[data-testid="stSidebar"] {display: none !important; visibility: hidden !important; width: 0 !important; min-width: 0 !important;}
+    [data-testid="collapsedControl"] {display: none !important; visibility: hidden !important;}
+    div[data-testid="stSidebarNav"] {display: none !important; visibility: hidden !important;}
+    button[kind="header"] {display: none !important;}
     .block-container {
         max-width: 1260px;
         padding-top: 1.0rem;
@@ -659,6 +662,7 @@ request_browser_landscape(fullscreen)
 if not fullscreen:
     st.title("📐 SenseOptics Метролог")
     st.caption("Лёгкий режим для Replit/free: замеры, калибровка, включения, маска и экспорт.")
+    st.caption(APP_VERSION)
 
     with st.container(border=True):
         st.markdown("**1. Загрузка изображения**")
@@ -679,6 +683,16 @@ if not fullscreen:
         elif use_sample:
             st.session_state.upload_bytes = sample.read_bytes()
             st.session_state.upload_name = sample.name
+
+        if st.session_state.upload_bytes is not None and st.session_state.upload_name:
+            u1, u2 = st.columns([3, 1])
+            u1.success(f"Загружено: {st.session_state.upload_name} · {len(st.session_state.upload_bytes) / 1024:.1f} КБ")
+            if u2.button("Сменить файл", use_container_width=True):
+                st.session_state.upload_bytes = None
+                st.session_state.upload_name = None
+                st.session_state.image_state_key = None
+                reset_work(reset_calibration=True, reset_mask_data=True)
+                st.rerun()
 else:
     st.markdown(
         "<div class='so-fs-hint'>📱 Полноэкранный landscape-режим: оставлен только холст замеров. "
@@ -706,7 +720,7 @@ if img_bgr is None:
             st.session_state.fullscreen_mode = False
             st.rerun()
     else:
-        st.info("Загрузите изображение. На телефоне и в Replit надёжнее пользоваться центральной областью загрузки.")
+        st.info("Загрузите изображение через центральную кнопку Upload. Боковая панель в этой версии не используется и скрыта.")
     st.stop()
 
 orig_h, orig_w = img_bgr.shape[:2]
