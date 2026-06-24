@@ -15,7 +15,6 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
 from PIL import Image as PILImage, ImageOps
 
 try:
@@ -45,7 +44,6 @@ BLUE = (40, 120, 230)
 ORANGE = (255, 150, 0)
 RED = (220, 50, 50)
 BLACK = (20, 20, 20)
-APP_VERSION = "app334 clean no-sidebar upload/fullscreen v2 — 2026-06-24"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -61,8 +59,6 @@ def _init_state() -> None:
         "last_click_id": None,
         "image_state_key": None,
         "fullscreen_mode": False,
-        "upload_bytes": None,
-        "upload_name": None,
         "mask": None,
         "mask_overlay": None,
         "mask_stats": None,
@@ -101,10 +97,8 @@ _init_state()
 st.markdown(
     """
 <style>
-    section[data-testid="stSidebar"] {display: none !important; visibility: hidden !important; width: 0 !important; min-width: 0 !important;}
-    [data-testid="collapsedControl"] {display: none !important; visibility: hidden !important;}
-    div[data-testid="stSidebarNav"] {display: none !important; visibility: hidden !important;}
-    button[kind="header"] {display: none !important;}
+    section[data-testid="stSidebar"] {display: none !important;}
+    [data-testid="collapsedControl"] {display: none !important;}
     .block-container {
         max-width: 1260px;
         padding-top: 1.0rem;
@@ -152,112 +146,6 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-
-
-def inject_mobile_fullscreen_css(fullscreen: bool) -> None:
-    """Полноэкранный мобильный режим.
-
-    В Replit/Chrome нельзя гарантировать настоящий fullscreen и lock ориентации,
-    поэтому делаем два слоя:
-    1) JS best-effort для requestFullscreen + landscape;
-    2) CSS fallback: если телефон в portrait, поворачиваем рабочую область как landscape.
-    """
-    if not fullscreen:
-        return
-
-    st.markdown(
-        """
-<style>
-    header, footer { visibility: hidden !important; height: 0 !important; }
-    section[data-testid="stSidebar"], [data-testid="collapsedControl"] {display: none !important;}
-
-    .block-container {
-        max-width: 100vw !important;
-        padding: 0.22rem 0.28rem 0.28rem 0.28rem !important;
-    }
-    .so-fs-hint {
-        padding: 0.28rem 0.5rem;
-        border-radius: 0.55rem;
-        background: rgba(80, 140, 255, 0.10);
-        font-size: 0.82rem;
-        margin: 0.12rem 0 0.28rem 0;
-    }
-    .so-fs-status {
-        opacity: 0.72;
-        font-size: 0.78rem;
-        margin: 0.10rem 0 0.25rem 0;
-    }
-    div[data-testid="stHorizontalBlock"] { gap: 0.28rem !important; }
-    div.stButton > button, div[data-testid="stDownloadButton"] > button {
-        min-height: 34px !important;
-        padding: 0.22rem 0.35rem !important;
-        font-size: 0.78rem !important;
-        border-radius: 8px !important;
-    }
-    div[role="radiogroup"] label {
-        padding: 0.10rem 0.12rem !important;
-        font-size: 0.78rem !important;
-    }
-    iframe[title="streamlit_image_coordinates.streamlit_image_coordinates"] {
-        display: block !important;
-        margin-left: auto !important;
-        margin-right: auto !important;
-    }
-
-    /* Если телефон физически остался вертикальным — имитируем landscape. */
-    @media screen and (max-width: 900px) and (orientation: portrait) {
-        html, body { overflow: hidden !important; }
-        .block-container {
-            position: fixed !important;
-            left: 0 !important;
-            top: 0 !important;
-            width: 100vh !important;
-            max-width: 100vh !important;
-            height: 100vw !important;
-            overflow: auto !important;
-            transform: rotate(90deg) translateY(-100vw);
-            transform-origin: top left;
-            z-index: 999999 !important;
-            padding: 0.18rem 0.25rem !important;
-        }
-    }
-</style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def request_browser_landscape(fullscreen: bool) -> None:
-    """Best-effort: настоящий fullscreen/landscape может быть заблокирован браузером или iframe Replit."""
-    if not fullscreen:
-        return
-    components.html(
-        """
-<button id="soFsBtn" style="
-  width: 100%; height: 30px; border-radius: 9px; border: 1px solid rgba(0,0,0,.15);
-  background: rgba(255,255,255,.92); font-size: 12px;">⛶ native fullscreen / landscape</button>
-<script>
-const btn = document.getElementById('soFsBtn');
-async function goFs(){
-  try {
-    const doc = window.parent.document;
-    const el = doc.documentElement;
-    if (!doc.fullscreenElement && el.requestFullscreen) {
-      await el.requestFullscreen().catch(() => {});
-    }
-    const so = window.parent.screen && window.parent.screen.orientation;
-    if (so && so.lock) {
-      await so.lock('landscape').catch(() => {});
-    }
-  } catch(e) {}
-}
-btn.addEventListener('click', goFs);
-setTimeout(goFs, 250);
-</script>
-        """,
-        height=34,
-        width=260,
-    )
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -655,58 +543,38 @@ def undo_last_point(mode: str) -> bool:
 # ════════════════════════════════════════════════════════════════════════
 #  UI: шапка и загрузка
 # ════════════════════════════════════════════════════════════════════════
-fullscreen = bool(st.session_state.fullscreen_mode)
-inject_mobile_fullscreen_css(fullscreen)
-request_browser_landscape(fullscreen)
+st.title("📐 SenseOptics Метролог")
+st.caption("Лёгкий режим для Replit/free: замеры, калибровка, включения, маска и экспорт.")
 
-if not fullscreen:
-    st.title("📐 SenseOptics Метролог")
-    st.caption("Лёгкий режим для Replit/free: замеры, калибровка, включения, маска и экспорт.")
-    st.caption(APP_VERSION)
-
-    with st.container(border=True):
-        st.markdown("**1. Загрузка изображения**")
-        main_up = st.file_uploader(
-            "Перетащите файл сюда или нажмите Browse files",
-            type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
-            key="main_upload",
-            help="Загрузка находится в основной области. Боковая панель не используется.",
-        )
-        sample = Path(__file__).parent / "sample" / "demo_template.png"
-        use_sample = False
-        if main_up is None and sample.exists() and st.session_state.upload_bytes is None:
-            use_sample = st.checkbox("Использовать demo_template.png", value=True)
-
-        if main_up is not None:
-            st.session_state.upload_bytes = main_up.getvalue()
-            st.session_state.upload_name = main_up.name
-        elif use_sample:
-            st.session_state.upload_bytes = sample.read_bytes()
-            st.session_state.upload_name = sample.name
-
-        if st.session_state.upload_bytes is not None and st.session_state.upload_name:
-            u1, u2 = st.columns([3, 1])
-            u1.success(f"Загружено: {st.session_state.upload_name} · {len(st.session_state.upload_bytes) / 1024:.1f} КБ")
-            if u2.button("Сменить файл", use_container_width=True):
-                st.session_state.upload_bytes = None
-                st.session_state.upload_name = None
-                st.session_state.image_state_key = None
-                reset_work(reset_calibration=True, reset_mask_data=True)
-                st.rerun()
-else:
-    st.markdown(
-        "<div class='so-fs-hint'>📱 Полноэкранный landscape-режим: оставлен только холст замеров. "
-        "Если браузер не повернулся сам — поверните телефон горизонтально или нажмите маленькую кнопку fullscreen.</div>",
-        unsafe_allow_html=True,
+with st.container(border=True):
+    st.markdown("**1. Загрузка изображения**")
+    main_up = st.file_uploader(
+        "Перетащите файл сюда или нажмите Browse files",
+        type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
+        key="main_upload",
+        help="Загрузка теперь находится в основной области. Боковая панель не используется.",
     )
+    sample = Path(__file__).parent / "sample" / "demo_template.png"
+    use_sample = False
+    if main_up is None and sample.exists():
+        use_sample = st.checkbox("Использовать demo_template.png", value=True)
 
 img_bgr = None
-src_name = st.session_state.upload_name
+src_name = None
 file_id = None
 scale = 1.0
 
-data = st.session_state.upload_bytes
-if data is not None and src_name:
+if main_up is not None:
+    data = main_up.getvalue()
+    src_name = main_up.name
+    file_id = file_fingerprint(data, src_name)
+    img_bgr, err = decode_image(data, src_name)
+    if err:
+        st.error(err)
+        st.stop()
+elif use_sample:
+    data = sample.read_bytes()
+    src_name = sample.name
     file_id = file_fingerprint(data, src_name)
     img_bgr, err = decode_image(data, src_name)
     if err:
@@ -714,13 +582,7 @@ if data is not None and src_name:
         st.stop()
 
 if img_bgr is None:
-    if fullscreen:
-        st.warning("Изображение не найдено в состоянии сессии. Вернитесь в обычный режим и загрузите файл заново.")
-        if st.button("↩️ Обычный режим"):
-            st.session_state.fullscreen_mode = False
-            st.rerun()
-    else:
-        st.info("Загрузите изображение через центральную кнопку Upload. Боковая панель в этой версии не используется и скрыта.")
+    st.info("Загрузите изображение. На телефоне и в Replit надёжнее пользоваться этой центральной областью загрузки.")
     st.stop()
 
 orig_h, orig_w = img_bgr.shape[:2]
@@ -728,64 +590,39 @@ orig_h, orig_w = img_bgr.shape[:2]
 # ════════════════════════════════════════════════════════════════════════
 #  UI: настройки работы
 # ════════════════════════════════════════════════════════════════════════
-if fullscreen:
-    w_max = max(500, min(2400, int(orig_w)))
-    default_w = min(w_max, max(1200, min(int(orig_w), 1600)))
-    t1, t2, t3, t4 = st.columns([0.95, 1.45, 2.1, 0.95])
-    if t1.button("↩️ Обычный", use_container_width=True):
-        st.session_state.fullscreen_mode = False
-        st.rerun()
-    max_w = t2.slider(
-        "Ширина, px",
-        min_value=500,
+fullscreen = st.toggle("🔍 Полноразмерный режим замеров", key="fullscreen_mode")
+
+with st.container(border=True):
+    st.markdown("**2. Настройки и режим**")
+    w_max = max(300, min(2400, int(orig_w)))
+    default_w = min(900, w_max)
+    c_width, c_ppm, c_ppm_btn, c_reset_ppm = st.columns([1.3, 1.0, 0.7, 0.7])
+    max_w = c_width.slider(
+        "Рабочая ширина, px",
+        min_value=300,
         max_value=w_max,
         value=default_w,
         step=50,
-        help="В fullscreen можно ставить 1200–1600 px, чтобы фото занимало почти весь экран телефона.",
-        key="work_width_fullscreen",
+        help="При изменении ширины замеры сбрасываются, чтобы масштаб не сломался.",
     )
-    with t3:
-        mode = st.radio("Режим", MODES, horizontal=True, label_visibility="collapsed", key="mode")
-    if t4.button("🗑 Очистить", use_container_width=True):
-        reset_work(reset_calibration=False, reset_mask_data=False)
+    ppm_value = float(st.session_state.px_per_mm or 0.0)
+    ppm_in = c_ppm.number_input(
+        "px/mm для рабочей картинки",
+        min_value=0.0,
+        value=ppm_value,
+        step=0.5,
+        format="%.4f",
+        help="Можно ввести вручную или откалибровать двумя кликами.",
+    )
+    if c_ppm_btn.button("Применить px/mm") and ppm_in > 0:
+        st.session_state.px_per_mm = float(ppm_in)
         st.rerun()
-else:
-    with st.container(border=True):
-        st.markdown("**2. Настройки и режим**")
-        fs_now = st.toggle("📱 Полноэкранный landscape-режим замеров", key="fullscreen_mode")
-        if fs_now:
-            st.rerun()
+    if c_reset_ppm.button("Сброс px/mm"):
+        st.session_state.px_per_mm = None
+        st.session_state.calib_pts = []
+        st.rerun()
 
-        w_max = max(300, min(2400, int(orig_w)))
-        default_w = min(900, w_max)
-        c_width, c_ppm, c_ppm_btn, c_reset_ppm = st.columns([1.3, 1.0, 0.7, 0.7])
-        max_w = c_width.slider(
-            "Рабочая ширина, px",
-            min_value=300,
-            max_value=w_max,
-            value=default_w,
-            step=50,
-            help="При изменении ширины замеры сбрасываются, чтобы масштаб не сломался.",
-            key="work_width_normal",
-        )
-        ppm_value = float(st.session_state.px_per_mm or 0.0)
-        ppm_in = c_ppm.number_input(
-            "px/mm для рабочей картинки",
-            min_value=0.0,
-            value=ppm_value,
-            step=0.5,
-            format="%.4f",
-            help="Можно ввести вручную или откалибровать двумя кликами.",
-        )
-        if c_ppm_btn.button("Применить px/mm") and ppm_in > 0:
-            st.session_state.px_per_mm = float(ppm_in)
-            st.rerun()
-        if c_reset_ppm.button("Сброс px/mm"):
-            st.session_state.px_per_mm = None
-            st.session_state.calib_pts = []
-            st.rerun()
-
-        mode = st.radio("Режим", MODES, horizontal=True, key="mode")
+    mode = st.radio("Режим", MODES, horizontal=True, key="mode")
 
 work, scale = cached_downscale(img_bgr, int(max_w))
 H, W = work.shape[:2]
@@ -865,7 +702,7 @@ if HAS_CLICK:
     val = st_imgcoords(
         PILImage.fromarray(overlay),
         width=W,
-        key=f"canvas_{image_state_key}_{mode}_{'fs' if fullscreen else 'normal'}",
+        key=f"canvas_{image_state_key}_{mode}",
     )
     if debug:
         st.write({
