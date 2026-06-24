@@ -1,9 +1,9 @@
 from __future__ import annotations
 # ════════════════════════════════════════════════════════════════════════
-#  SenseOptics Метролог — Replit/mobile friendly версия
+#  SenseOptics Метролог — Replit-friendly версия
 #  Лёгкий геометрический метрологический инструмент:
 #  линия/диаметр, окружность, площадь, ручной счётчик включений,
-#  калибровка по двум кликам, маска включений, экспорт PNG/JSON/XLSX/CSV.
+#  калибровка по двум кликам, экспорт PNG/JSON/XLSX/CSV.
 # ════════════════════════════════════════════════════════════════════════
 import hashlib
 import io
@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image as PILImage, ImageOps
 
 try:
@@ -30,12 +31,7 @@ try:
 except Exception:
     HAS_XLSX = False
 
-st.set_page_config(
-    page_title="SenseOptics Метролог",
-    page_icon="📐",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="SenseOptics Метролог", page_icon="📐", layout="wide")
 
 MODES = ["Линия / диаметр", "Окружность", "Площадь", "Включения", "Калибровка (2 клика)"]
 
@@ -46,9 +42,6 @@ RED = (220, 50, 50)
 BLACK = (20, 20, 20)
 
 
-# ════════════════════════════════════════════════════════════════════════
-#  Состояние
-# ════════════════════════════════════════════════════════════════════════
 def _init_state() -> None:
     defaults = {
         "meas": [],
@@ -59,24 +52,15 @@ def _init_state() -> None:
         "last_click_id": None,
         "image_state_key": None,
         "fullscreen_mode": False,
-        "mask": None,
-        "mask_overlay": None,
-        "mask_stats": None,
-        "mask_settings": None,
+        "upload_bytes": None,
+        "upload_name": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
-def reset_mask() -> None:
-    st.session_state.mask = None
-    st.session_state.mask_overlay = None
-    st.session_state.mask_stats = None
-    st.session_state.mask_settings = None
-
-
-def reset_work(reset_calibration: bool = True, reset_mask_data: bool = True) -> None:
+def reset_work(reset_calibration: bool = True) -> None:
     st.session_state.meas = []
     st.session_state.pending = []
     st.session_state.inclusions = []
@@ -84,68 +68,104 @@ def reset_work(reset_calibration: bool = True, reset_mask_data: bool = True) -> 
     st.session_state.last_click_id = None
     if reset_calibration:
         st.session_state.px_per_mm = None
-    if reset_mask_data:
-        reset_mask()
 
 
 _init_state()
 
 
-# ════════════════════════════════════════════════════════════════════════
-#  CSS / мобильный вид
-# ════════════════════════════════════════════════════════════════════════
-st.markdown(
+def inject_mobile_fullscreen_css(fullscreen: bool) -> None:
+    """Компактный интерфейс + CSS-поворот всей рабочей области на телефоне.
+
+    В браузере невозможно гарантированно заблокировать ориентацию из Streamlit/Replit,
+    поэтому здесь два слоя:
+    1) JS best-effort пробует fullscreen + landscape;
+    2) CSS fallback поворачивает рабочую область в portrait-режиме телефона.
     """
-<style>
-    section[data-testid="stSidebar"] {display: none !important;}
-    [data-testid="collapsedControl"] {display: none !important;}
+    base = """
+    <style>
+    .so-top-hint {
+        padding: .35rem .55rem;
+        border-radius: .55rem;
+        background: rgba(127,127,127,.10);
+        font-size: .92rem;
+        margin: .25rem 0 .45rem 0;
+    }
+    div.stButton > button {
+        min-height: 2.5rem;
+    }
+    </style>
+    """
+    if not fullscreen:
+        st.markdown(base, unsafe_allow_html=True)
+        return
+
+    st.markdown(base + """
+    <style>
+    header, footer { visibility: hidden; height: 0; }
+    [data-testid="stSidebar"], [data-testid="collapsedControl"] { display: none !important; }
     .block-container {
-        max-width: 1260px;
-        padding-top: 1.0rem;
-        padding-left: clamp(0.45rem, 2vw, 2rem);
-        padding-right: clamp(0.45rem, 2vw, 2rem);
+        max-width: 100vw !important;
+        padding: .25rem .35rem .35rem .35rem !important;
     }
-    div[data-testid="stFileUploader"] section {
-        border-radius: 16px;
-        min-height: 86px;
+    h1, [data-testid="stCaptionContainer"] { display: none !important; }
+    div[data-testid="stHorizontalBlock"] { gap: .35rem; }
+    section.main, div[data-testid="stAppViewContainer"] {
+        background: rgb(250,250,250);
     }
-    div.stButton > button, div[data-testid="stDownloadButton"] > button {
-        min-height: 42px;
-        border-radius: 10px;
-        width: 100%;
-    }
-    div[role="radiogroup"] label {
-        padding: 0.25rem 0.25rem;
-    }
-    .so-hint {
-        padding: 0.65rem 0.8rem;
-        border-radius: 12px;
-        background: rgba(128, 128, 128, 0.08);
-        margin: 0.4rem 0 0.7rem 0;
-        font-size: 0.92rem;
-    }
-    .so-small {
-        opacity: 0.78;
-        font-size: 0.86rem;
-    }
-    @media (max-width: 760px) {
+
+    /* Телефон вертикально: имитируем landscape, поворачивая рабочую область. */
+    @media screen and (max-width: 900px) and (orientation: portrait) {
         .block-container {
-            padding-left: 0.35rem;
-            padding-right: 0.35rem;
-            padding-top: 0.55rem;
+            position: fixed !important;
+            left: 0 !important;
+            top: 0 !important;
+            width: 100vh !important;
+            max-width: 100vh !important;
+            height: 100vw !important;
+            overflow: auto !important;
+            transform: rotate(90deg) translateY(-100vw);
+            transform-origin: top left;
+            z-index: 999999;
+            padding: .25rem .35rem !important;
         }
-        h1 {font-size: 1.35rem !important;}
-        h2 {font-size: 1.12rem !important;}
-        h3 {font-size: 1.02rem !important;}
-        div.stButton > button, div[data-testid="stDownloadButton"] > button {
-            min-height: 46px;
-            font-size: 0.88rem;
-        }
+        body { overflow: hidden !important; }
     }
-</style>
-""",
-    unsafe_allow_html=True,
-)
+
+    /* Компонент картинки занимает максимум доступного места. */
+    iframe[title="streamlit_image_coordinates.streamlit_image_coordinates"] {
+        display: block !important;
+        margin-left: auto !important;
+        margin-right: auto !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def request_browser_landscape(fullscreen: bool) -> None:
+    """Best-effort JS: в некоторых мобильных браузерах/Replit может быть заблокировано."""
+    if not fullscreen:
+        return
+    components.html(
+        """
+        <script>
+        (async () => {
+          try {
+            const doc = window.parent.document;
+            const el = doc.documentElement;
+            if (!doc.fullscreenElement && el.requestFullscreen) {
+              await el.requestFullscreen().catch(() => {});
+            }
+            const so = window.parent.screen && window.parent.screen.orientation;
+            if (so && so.lock) {
+              await so.lock('landscape').catch(() => {});
+            }
+          } catch (e) {}
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -294,8 +314,7 @@ def decode_image(data: bytes, name: str = "") -> tuple[Optional[np.ndarray], Opt
         return None, f"Не удалось прочитать изображение {name!r}: {e}"
 
 
-@st.cache_data(show_spinner=False)
-def cached_downscale(img: np.ndarray, max_w: int) -> tuple[np.ndarray, float]:
+def downscale(img: np.ndarray, max_w: int) -> tuple[np.ndarray, float]:
     h, w = img.shape[:2]
     if w <= max_w:
         return img.copy(), 1.0
@@ -305,83 +324,36 @@ def cached_downscale(img: np.ndarray, max_w: int) -> tuple[np.ndarray, float]:
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  Маска тёмных/светлых включений
+#  Маска тёмных включений
 # ════════════════════════════════════════════════════════════════════════
-def _odd(v: int) -> int:
-    v = int(v)
-    return v if v % 2 == 1 else v + 1
-
-
-def build_inclusion_mask(
-    work_bgr: np.ndarray,
-    threshold_mode: str = "Otsu",
-    manual_threshold: int = 90,
-    min_area: int = 4,
-    max_area: int = 0,
-    detect_bright: bool = False,
-    blur_size: int = 3,
-    close_iter: int = 1,
-) -> np.ndarray:
-    gray = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2GRAY)
-    if blur_size > 1:
-        gray = cv2.GaussianBlur(gray, (_odd(blur_size), _odd(blur_size)), 0)
-
-    if threshold_mode == "Otsu":
-        flag = cv2.THRESH_BINARY if detect_bright else cv2.THRESH_BINARY_INV
-        _, mask = cv2.threshold(gray, 0, 255, flag + cv2.THRESH_OTSU)
-    else:
-        if detect_bright:
-            mask = (gray >= int(manual_threshold)).astype(np.uint8) * 255
-        else:
-            mask = (gray <= int(manual_threshold)).astype(np.uint8) * 255
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    if close_iter > 0:
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=int(close_iter))
-
+def inclusion_mask(gray, dark_k=2.0, min_area=4) -> np.ndarray:
+    blur = cv2.GaussianBlur(gray, (15, 15), 0)
+    diff = blur.astype(np.int16) - gray.astype(np.int16)
+    thr = max(5.0, float(diff.mean()) + dark_k * float(diff.std()))
+    mask = (diff >= thr).astype(np.uint8) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
     n, lab, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     clean = np.zeros_like(mask)
     for label in range(1, n):
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        if area < int(min_area):
-            continue
-        if max_area and area > int(max_area):
-            continue
-        clean[lab == label] = 255
+        if stats[label, cv2.CC_STAT_AREA] >= min_area:
+            clean[lab == label] = 255
     return clean
 
 
-def make_mask_overlay(work_bgr: np.ndarray, mask: np.ndarray, alpha: float = 0.45) -> np.ndarray:
-    rgb = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2RGB).copy()
-    color = np.zeros_like(rgb)
-    color[:, :] = RED
-    m = mask > 0
-    rgb[m] = cv2.addWeighted(rgb, 1.0 - alpha, color, alpha, 0)[m]
-    return rgb
-
-
-def mask_stats(mask: np.ndarray, ppm: Optional[float]) -> Dict[str, Any]:
+def mask_stats(mask, ppm) -> Dict[str, Any]:
     n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     areas = [int(stats[label, cv2.CC_STAT_AREA]) for label in range(1, n)]
-    total_px = int(np.sum(mask > 0))
-    out: Dict[str, Any] = {
+    out = {
         "n_objects": n - 1,
-        "total_mask_px": total_px,
-        "area_fraction": round(float(np.mean(mask > 0)), 6),
+        "total_dark_px": int(np.sum(mask > 0)),
+        "dark_area_frac": round(float(np.mean(mask > 0)), 5),
         "max_object_area_px": int(max(areas)) if areas else 0,
-        "mean_object_area_px": round(float(np.mean(areas)), 2) if areas else 0.0,
+        "mean_object_area_px": round(float(np.mean(areas)), 1) if areas else 0.0,
     }
     if ppm:
-        out["total_area_mm2"] = round(total_px / (ppm * ppm), 5)
-        out["max_object_area_mm2"] = round(out["max_object_area_px"] / (ppm * ppm), 5)
-        out["mean_object_area_mm2"] = round(out["mean_object_area_px"] / (ppm * ppm), 5)
+        out["max_object_equiv_diam_mm"] = round((out["max_object_area_px"] ** 0.5) / ppm, 3)
     return out
-
-
-def gray_png_bytes(gray: np.ndarray) -> bytes:
-    ok, buf = cv2.imencode(".png", gray)
-    return buf.tobytes() if ok else b""
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -402,7 +374,7 @@ def safe_stem(name: str) -> str:
     return Path(name).stem.replace(" ", "_") or "image"
 
 
-def build_export(src, W, H, ppm, meas, inclusions, scale, mask_info=None) -> Dict[str, Any]:
+def build_export(src, W, H, ppm, meas, inclusions, scale) -> Dict[str, Any]:
     return {
         "source": src,
         "working_size_px": [W, H],
@@ -413,7 +385,6 @@ def build_export(src, W, H, ppm, meas, inclusions, scale, mask_info=None) -> Dic
             "count": len(inclusions),
             "points": [{"n": i + 1, "x": int(x), "y": int(y)} for i, (x, y) in enumerate(inclusions)],
         },
-        "mask": mask_info,
     }
 
 
@@ -456,14 +427,6 @@ def build_xlsx(export) -> bytes:
     ws_inc.append([])
     ws_inc.append(["Всего", export["inclusions"]["count"]])
 
-    ws_mask = wb.create_sheet("Маска")
-    mask_info = export.get("mask") or {}
-    if mask_info:
-        for k, v in mask_info.items():
-            ws_mask.append([k, json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v])
-    else:
-        ws_mask.append(["mask", "not built"])
-
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -484,10 +447,6 @@ def build_csv(export) -> str:
     lines.append("")
     lines.append(f"inclusions_count,{export['inclusions']['count']}")
     lines.append(f"px_per_mm_working_image,{export['px_per_mm_working_image']}")
-    if export.get("mask"):
-        lines.append("")
-        for k, v in export["mask"].items():
-            lines.append(f"mask_{k},{v}")
     return "\n".join(lines)
 
 
@@ -527,52 +486,60 @@ def handle_click(x: int, y: int, mode: str) -> None:
             st.session_state.calib_pts.append([x, y])
 
 
-def undo_last_point(mode: str) -> bool:
-    if mode == "Калибровка (2 клика)" and st.session_state.calib_pts:
-        st.session_state.calib_pts.pop()
-        return True
-    if st.session_state.pending:
-        st.session_state.pending.pop()
-        return True
-    if mode == "Включения" and st.session_state.inclusions:
-        st.session_state.inclusions.pop()
-        return True
-    return False
-
-
 # ════════════════════════════════════════════════════════════════════════
-#  UI: шапка и загрузка
+#  UI
 # ════════════════════════════════════════════════════════════════════════
-st.title("📐 SenseOptics Метролог")
-st.caption("Лёгкий режим для Replit/free: замеры, калибровка, включения, маска и экспорт.")
+fullscreen = bool(st.session_state.fullscreen_mode)
+inject_mobile_fullscreen_css(fullscreen)
+request_browser_landscape(fullscreen)
 
-with st.container(border=True):
-    st.markdown("**1. Загрузка изображения**")
-    main_up = st.file_uploader(
-        "Перетащите файл сюда или нажмите Browse files",
+if not fullscreen:
+    st.sidebar.title("📐 SenseOptics Метролог")
+    st.sidebar.caption("Лёгкий режим для Replit/free")
+
+    side_up = st.sidebar.file_uploader(
+        "Изображение",
         type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
-        key="main_upload",
-        help="Загрузка теперь находится в основной области. Боковая панель не используется.",
+        key="side_upload",
     )
-    sample = Path(__file__).parent / "sample" / "demo_template.png"
-    use_sample = False
-    if main_up is None and sample.exists():
-        use_sample = st.checkbox("Использовать demo_template.png", value=True)
 
+    st.title("📐 SenseOptics Метролог")
+    st.caption("Загрузите фото, выберите режим и кликайте прямо по изображению.")
+
+    main_up = None
+    if side_up is None:
+        main_up = st.file_uploader(
+            "Загрузка в основной области — используйте её, если кнопка в боковой панели не открывается",
+            type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
+            key="main_upload",
+        )
+    up = side_up or main_up
+    if up is not None:
+        st.session_state.upload_bytes = up.getvalue()
+        st.session_state.upload_name = up.name
+else:
+    st.markdown(
+        '<div class="so-top-hint">📱 Полноэкранный landscape-режим: фото и точки замера занимают почти весь экран. '
+        'Если браузер не повернулся сам — поверните телефон горизонтально.</div>',
+        unsafe_allow_html=True,
+    )
+
+sample = Path(__file__).parent / "sample" / "demo_template.png"
 img_bgr = None
 src_name = None
 file_id = None
 scale = 1.0
 
-if main_up is not None:
-    data = main_up.getvalue()
-    src_name = main_up.name
+data = st.session_state.upload_bytes
+src_name = st.session_state.upload_name
+
+if data is not None and src_name:
     file_id = file_fingerprint(data, src_name)
     img_bgr, err = decode_image(data, src_name)
     if err:
         st.error(err)
         st.stop()
-elif use_sample:
+elif (not fullscreen) and sample.exists() and st.sidebar.checkbox("Использовать пример", value=True):
     data = sample.read_bytes()
     src_name = sample.name
     file_id = file_fingerprint(data, src_name)
@@ -582,111 +549,111 @@ elif use_sample:
         st.stop()
 
 if img_bgr is None:
-    st.info("Загрузите изображение. На телефоне и в Replit надёжнее пользоваться этой центральной областью загрузки.")
+    st.info("Загрузите изображение. На Replit часто надёжнее просто перетащить файл в область загрузки.")
     st.stop()
 
 orig_h, orig_w = img_bgr.shape[:2]
-
-# ════════════════════════════════════════════════════════════════════════
-#  UI: настройки работы
-# ════════════════════════════════════════════════════════════════════════
-fullscreen = st.toggle("🔍 Полноразмерный режим замеров", key="fullscreen_mode")
-
-with st.container(border=True):
-    st.markdown("**2. Настройки и режим**")
-    w_max = max(300, min(2400, int(orig_w)))
-    default_w = min(900, w_max)
-    c_width, c_ppm, c_ppm_btn, c_reset_ppm = st.columns([1.3, 1.0, 0.7, 0.7])
-    max_w = c_width.slider(
+if fullscreen:
+    fs1, fs2, fs3 = st.columns([1.25, 2.4, 1.05])
+    with fs1:
+        if st.button("↩️ Обычный режим", use_container_width=True):
+            st.session_state.fullscreen_mode = False
+            st.rerun()
+    with fs2:
+        max_w = st.slider(
+            "Рабочая ширина, px",
+            min_value=500,
+            max_value=2200,
+            value=min(1400, max(900, orig_w)),
+            step=100,
+            help="Для телефона обычно удобно 900–1400 px. При изменении ширины замеры сбрасываются.",
+            key="work_width_fullscreen",
+        )
+    with fs3:
+        if st.button("🗑 Очистить", use_container_width=True):
+            reset_work(reset_calibration=False)
+            st.rerun()
+else:
+    max_w = st.sidebar.slider(
         "Рабочая ширина, px",
-        min_value=300,
-        max_value=w_max,
-        value=default_w,
-        step=50,
-        help="При изменении ширины замеры сбрасываются, чтобы масштаб не сломался.",
+        min_value=500,
+        max_value=1800,
+        value=900,
+        step=100,
+        help="Для Replit/free лучше 700–1100 px. При изменении ширины замеры сбрасываются, чтобы не сломать масштаб.",
+        key="work_width_normal",
     )
-    ppm_value = float(st.session_state.px_per_mm or 0.0)
-    ppm_in = c_ppm.number_input(
-        "px/mm для рабочей картинки",
-        min_value=0.0,
-        value=ppm_value,
-        step=0.5,
-        format="%.4f",
-        help="Можно ввести вручную или откалибровать двумя кликами.",
-    )
-    if c_ppm_btn.button("Применить px/mm") and ppm_in > 0:
-        st.session_state.px_per_mm = float(ppm_in)
-        st.rerun()
-    if c_reset_ppm.button("Сброс px/mm"):
-        st.session_state.px_per_mm = None
-        st.session_state.calib_pts = []
-        st.rerun()
-
-    mode = st.radio("Режим", MODES, horizontal=True, key="mode")
-
-work, scale = cached_downscale(img_bgr, int(max_w))
+work, scale = downscale(img_bgr, max_w)
 H, W = work.shape[:2]
 gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
 
 image_state_key = f"{file_id}:{W}x{H}"
 if st.session_state.image_state_key != image_state_key:
-    reset_work(reset_calibration=True, reset_mask_data=True)
+    reset_work(reset_calibration=True)
     st.session_state.image_state_key = image_state_key
+
+if not fullscreen:
+    st.sidebar.caption(f"Файл: {src_name}")
+    st.sidebar.caption(f"Оригинал: {orig_w}×{orig_h}px · работа: {W}×{H}px · scale={scale:.4f}")
+
+    st.sidebar.subheader("Калибровка")
+    cur = st.session_state.px_per_mm
+    st.sidebar.caption(f"Текущее: **{cur:.4f} px/mm**" if cur else "Текущее: не задана")
+    ppm_in = st.sidebar.number_input(
+        "px/mm для рабочей картинки",
+        min_value=0.0,
+        value=0.0,
+        step=0.5,
+        format="%.4f",
+        help="Надёжнее калибровать по двум кликам на текущем изображении. Если меняете рабочую ширину — калибровка сбросится.",
+    )
+    cs1, cs2 = st.sidebar.columns(2)
+    if cs1.button("Применить") and ppm_in > 0:
+        st.session_state.px_per_mm = ppm_in
+        st.rerun()
+    if cs2.button("Сброс"):
+        st.session_state.px_per_mm = None
+        st.session_state.calib_pts = []
+        st.rerun()
+else:
+    cur = st.session_state.px_per_mm
+    st.caption(
+        f"Файл: {src_name} · оригинал {orig_w}×{orig_h}px · работа {W}×{H}px"
+        + (f" · калибровка {cur:.4f} px/mm" if cur else " · калибровка не задана")
+    )
 
 ppm = st.session_state.px_per_mm
 
+if fullscreen:
+    mode = st.radio("Режим", MODES, horizontal=True, label_visibility="collapsed")
+else:
+    mode = st.radio("Режим", MODES, horizontal=True)
 hints = {
     "Линия / диаметр": "Два клика: начало и конец отрезка.",
     "Окружность": "Клик 1 — центр, клик 2 — точка на окружности.",
     "Площадь": "Кликайте вершины контура, затем нажмите «Замкнуть площадь».",
-    "Включения": "Клик по включению добавляет точку в ручной счётчик.",
+    "Включения": "Клик по включению добавляет точку в счётчик.",
     "Калибровка (2 клика)": "Два клика по концам эталона, затем введите известную длину.",
 }
-st.markdown(f"<div class='so-hint'>👆 {hints[mode]}</div>", unsafe_allow_html=True)
+st.caption("👆 " + hints[mode])
 
-status_text = (
-    f"Файл: **{src_name}** · оригинал: **{orig_w}×{orig_h}px** · "
-    f"рабочее: **{W}×{H}px** · scale={scale:.4f} · "
-    + (f"калибровка: **{ppm:.4f} px/mm**" if ppm else "калибровка: **не задана**")
-)
-st.markdown(f"<div class='so-small'>{status_text}</div>", unsafe_allow_html=True)
+# кнопки управления рядом с холстом
+c1, c2, c3, c4, c5 = st.columns([1.3, 1.3, 1.15, 1.55, .8])
+if c1.button("↩️ Сбросить текущие точки", use_container_width=True):
+    st.session_state.pending = []
+    st.session_state.calib_pts = [] if mode == "Калибровка (2 клика)" else st.session_state.calib_pts
+    st.rerun()
+if c2.button("↩️ Удалить последний замер", use_container_width=True) and st.session_state.meas:
+    st.session_state.meas.pop()
+    st.rerun()
+if c3.button("🗑 Очистить всё", use_container_width=True):
+    reset_work(reset_calibration=False)
+    st.rerun()
+if c4.button("📱 Полный экран landscape" if not fullscreen else "↩️ Выйти из fullscreen", use_container_width=True):
+    st.session_state.fullscreen_mode = not fullscreen
+    st.rerun()
+debug = c5.checkbox("debug")
 
-# ════════════════════════════════════════════════════════════════════════
-#  UI: центральные кнопки
-# ════════════════════════════════════════════════════════════════════════
-if fullscreen:
-    b1, b2, b3, b4 = st.columns(4)
-    if b1.button("↩️ Отменить точку"):
-        if undo_last_point(mode):
-            st.rerun()
-    if b2.button("↩️ Удалить замер") and st.session_state.meas:
-        st.session_state.meas.pop()
-        st.rerun()
-    if b3.button("🗑 Очистить"):
-        reset_work(reset_calibration=False, reset_mask_data=False)
-        st.rerun()
-    debug = b4.checkbox("debug")
-else:
-    b1, b2, b3, b4, b5 = st.columns(5)
-    if b1.button("↩️ Отменить точку"):
-        if undo_last_point(mode):
-            st.rerun()
-    if b2.button("Сбросить текущие точки"):
-        st.session_state.pending = []
-        if mode == "Калибровка (2 клика)":
-            st.session_state.calib_pts = []
-        st.rerun()
-    if b3.button("↩️ Удалить последний замер") and st.session_state.meas:
-        st.session_state.meas.pop()
-        st.rerun()
-    if b4.button("🗑 Очистить всё"):
-        reset_work(reset_calibration=False, reset_mask_data=False)
-        st.rerun()
-    debug = b5.checkbox("debug")
-
-# ════════════════════════════════════════════════════════════════════════
-#  Холст / клики
-# ════════════════════════════════════════════════════════════════════════
 overlay = draw_overlay(
     work,
     st.session_state.meas,
@@ -702,7 +669,7 @@ if HAS_CLICK:
     val = st_imgcoords(
         PILImage.fromarray(overlay),
         width=W,
-        key=f"canvas_{image_state_key}_{mode}",
+        key=f"canvas_{image_state_key}_{mode}_{'fs' if fullscreen else 'normal'}",
     )
     if debug:
         st.write({
@@ -738,9 +705,6 @@ st.caption(
     f"замеры: {len(st.session_state.meas)} · включения: {len(st.session_state.inclusions)}"
 )
 
-# ════════════════════════════════════════════════════════════════════════
-#  Действия для площади и калибровки
-# ════════════════════════════════════════════════════════════════════════
 if mode == "Площадь":
     pc1, pc2 = st.columns(2)
     if pc1.button("✅ Замкнуть площадь"):
@@ -757,163 +721,111 @@ if mode == "Площадь":
 if mode == "Калибровка (2 клика)" and len(st.session_state.calib_pts) == 2:
     d_px = dist(st.session_state.calib_pts[0], st.session_state.calib_pts[1])
     st.info(f"Расстояние между точками: **{d_px:.1f} px**")
-    kc1, kc2 = st.columns([1, 1])
-    known = kc1.number_input("Известная длина эталона, мм", min_value=0.001, value=10.0, step=1.0)
-    if kc2.button("Применить калибровку") and known > 0:
+    known = st.number_input("Известная длина эталона, мм", min_value=0.001, value=10.0, step=1.0)
+    if st.button("Применить калибровку") and known > 0:
         st.session_state.px_per_mm = d_px / known
         st.rerun()
 
+
+if fullscreen:
+    st.caption(
+        f"Точки: {len(st.session_state.pending)} · калибровка: {len(st.session_state.calib_pts)} · "
+        f"замеры: {len(st.session_state.meas)} · включения: {len(st.session_state.inclusions)}"
+    )
+    st.stop()
+
 # ════════════════════════════════════════════════════════════════════════
-#  Результаты и маска
+#  Результаты
 # ════════════════════════════════════════════════════════════════════════
-if not fullscreen:
-    res_l, res_r = st.columns([1, 1])
+res_l, res_r = st.columns([1, 1])
 
-    with res_l:
-        with st.expander(f"📏 Замеры ({len(st.session_state.meas)})", expanded=True):
-            if st.session_state.meas:
-                for i, m in enumerate(st.session_state.meas):
-                    mm = measure_metrics(m, ppm)
-                    if m["type"] == "line":
-                        txt = f"{i + 1}. Линия: {mm['length_px']} px" + (f" = {mm['length_mm']} мм" if ppm else "")
-                    elif m["type"] == "circle":
-                        txt = f"{i + 1}. Окружность: D={mm['diameter_px']} px, S={mm['area_px2']} px²" + (
-                            f" · D={mm['diameter_mm']} мм, S={mm['area_mm2']} мм²" if ppm else ""
-                        )
-                    else:
-                        txt = f"{i + 1}. Площадь: {mm['area_px2']} px² ({mm['n_vertices']} верш.)" + (
-                            f" = {mm['area_mm2']} мм²" if ppm else ""
-                        )
-                    dc1, dc2 = st.columns([5, 1])
-                    dc1.write(txt)
-                    if dc2.button("✕", key=f"del_meas_{i}"):
-                        st.session_state.meas.pop(i)
-                        st.rerun()
+with res_l:
+    st.subheader(f"Замеры ({len(st.session_state.meas)})")
+    if st.session_state.meas:
+        for i, m in enumerate(st.session_state.meas):
+            mm = measure_metrics(m, ppm)
+            if m["type"] == "line":
+                txt = f"{i + 1}. Линия: {mm['length_px']} px" + (f" = {mm['length_mm']} мм" if ppm else "")
+            elif m["type"] == "circle":
+                txt = f"{i + 1}. Окружность: D={mm['diameter_px']} px, S={mm['area_px2']} px²" + (
+                    f" · D={mm['diameter_mm']} мм, S={mm['area_mm2']} мм²" if ppm else ""
+                )
             else:
-                st.caption("Пока нет замеров.")
+                txt = f"{i + 1}. Площадь: {mm['area_px2']} px² ({mm['n_vertices']} верш.)" + (
+                    f" = {mm['area_mm2']} мм²" if ppm else ""
+                )
+            dc1, dc2 = st.columns([5, 1])
+            dc1.write(txt)
+            if dc2.button("✕", key=f"del_meas_{i}"):
+                st.session_state.meas.pop(i)
+                st.rerun()
+    else:
+        st.caption("Пока нет замеров.")
 
-    with res_r:
-        with st.expander(f"🔴 Включения: {len(st.session_state.inclusions)}", expanded=True):
-            if st.session_state.inclusions:
-                if st.button("🗑 Очистить ручные включения"):
-                    st.session_state.inclusions = []
-                    st.rerun()
-            else:
-                st.caption("Ручной счётчик пуст.")
-
-    with st.expander("🧩 Маска включений / отдача маски", expanded=(mode == "Включения")):
-        st.caption("Маска строится только по кнопке — она не пересчитывается после каждого клика по изображению.")
-        m1, m2, m3 = st.columns(3)
-        threshold_mode = m1.radio("Порог", ["Otsu", "Manual"], horizontal=True)
-        manual_threshold = m2.slider("Manual threshold", 0, 255, 90, 1)
-        detect_bright = m3.checkbox("Искать светлые, не тёмные", value=False)
-
-        m4, m5, m6, m7 = st.columns(4)
-        min_area = m4.number_input("min area, px²", min_value=1, max_value=1000000, value=4, step=1)
-        max_area = m5.number_input("max area, px² (0 = без лимита)", min_value=0, max_value=10000000, value=0, step=10)
-        blur_size = m6.slider("blur", 1, 15, 3, 2)
-        close_iter = m7.slider("close", 0, 5, 1, 1)
-
-        mb1, mb2 = st.columns([1, 1])
-        if mb1.button("🧩 Построить / обновить маску"):
-            mask = build_inclusion_mask(
-                work,
-                threshold_mode=threshold_mode,
-                manual_threshold=manual_threshold,
-                min_area=int(min_area),
-                max_area=int(max_area),
-                detect_bright=detect_bright,
-                blur_size=int(blur_size),
-                close_iter=int(close_iter),
-            )
-            overlay_mask = make_mask_overlay(work, mask)
-            stats = mask_stats(mask, ppm)
-            st.session_state.mask = mask
-            st.session_state.mask_overlay = overlay_mask
-            st.session_state.mask_stats = stats
-            st.session_state.mask_settings = {
-                "threshold_mode": threshold_mode,
-                "manual_threshold": int(manual_threshold),
-                "detect_bright": bool(detect_bright),
-                "min_area_px": int(min_area),
-                "max_area_px": int(max_area),
-                "blur_size": int(blur_size),
-                "close_iter": int(close_iter),
-            }
+with res_r:
+    st.subheader(f"Включения: {len(st.session_state.inclusions)}")
+    if st.session_state.inclusions:
+        if st.button("🗑 Очистить включения"):
+            st.session_state.inclusions = []
             st.rerun()
-        if mb2.button("🗑 Сбросить маску"):
-            reset_mask()
-            st.rerun()
-
-        if st.session_state.mask is not None:
-            st.image(st.session_state.mask_overlay, caption="Overlay маски", use_container_width=False)
-            st.json(st.session_state.mask_stats)
-            md1, md2 = st.columns(2)
-            md1.download_button(
-                "⬇️ Скачать mask.png",
-                gray_png_bytes(st.session_state.mask),
+    if st.checkbox("Маска тёмных включений (авто)"):
+        mk1, mk2 = st.columns(2)
+        dark_k = mk1.slider("Чувствит. (k)", 0.5, 5.0, 2.0, 0.1)
+        min_a = mk2.slider("Мин. площадь px²", 1, 50, 4, 1)
+        mask = inclusion_mask(gray, dark_k, min_a)
+        mov = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        mov[mask > 0] = RED
+        st.image(mov, caption="Маска (красный)", use_container_width=False)
+        st.json(mask_stats(mask, ppm))
+        ok, mbuf = cv2.imencode(".png", mask)
+        if ok:
+            st.download_button(
+                "⬇️ Маска PNG",
+                mbuf.tobytes(),
                 file_name=f"mask_{safe_stem(src_name)}.png",
                 mime="image/png",
             )
-            md2.download_button(
-                "⬇️ Скачать mask_overlay.png",
-                png_bytes(st.session_state.mask_overlay),
-                file_name=f"mask_overlay_{safe_stem(src_name)}.png",
-                mime="image/png",
-            )
-        else:
-            st.caption("Маска ещё не построена.")
-else:
-    st.caption("Полноразмерный режим: результаты и экспорт скрыты, чтобы не занимать экран. Выключите режим, чтобы увидеть таблицы, маску и экспорт.")
 
 # ════════════════════════════════════════════════════════════════════════
 #  Экспорт
 # ════════════════════════════════════════════════════════════════════════
-if not fullscreen:
-    st.divider()
-    with st.expander("⬇️ Экспорт", expanded=True):
-        mask_info = None
-        if st.session_state.mask_stats is not None:
-            mask_info = {
-                "stats": st.session_state.mask_stats,
-                "settings": st.session_state.mask_settings,
-                "files": ["mask.png", "mask_overlay.png"],
-            }
-        export = build_export(src_name, W, H, ppm, st.session_state.meas, st.session_state.inclusions, scale, mask_info)
-        annotated = draw_overlay(
-            work,
-            st.session_state.meas,
-            [],
-            st.session_state.inclusions,
-            st.session_state.calib_pts,
-            ppm,
-            mode,
-        )
+st.divider()
+st.subheader("Экспорт")
+export = build_export(src_name, W, H, ppm, st.session_state.meas, st.session_state.inclusions, scale)
+annotated = draw_overlay(
+    work,
+    st.session_state.meas,
+    [],
+    st.session_state.inclusions,
+    st.session_state.calib_pts,
+    ppm,
+    mode,
+)
 
-        e1, e2, e3 = st.columns(3)
-        e1.download_button(
-            "🖼 Изображение с замерами PNG",
-            png_bytes(annotated),
-            file_name=f"annotated_{safe_stem(src_name)}.png",
-            mime="image/png",
-        )
-        e2.download_button(
-            "⬇️ JSON",
-            safe_json(export),
-            file_name=f"measure_{safe_stem(src_name)}.json",
-            mime="application/json",
-        )
-        if HAS_XLSX:
-            e3.download_button(
-                "⬇️ Excel (.xlsx)",
-                build_xlsx(export),
-                file_name=f"measure_{safe_stem(src_name)}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        else:
-            e3.download_button(
-                "⬇️ CSV",
-                build_csv(export),
-                file_name=f"measure_{safe_stem(src_name)}.csv",
-                mime="text/csv",
-            )
+e1, e2, e3 = st.columns(3)
+e1.download_button(
+    "🖼 Изображение с замерами PNG",
+    png_bytes(annotated),
+    file_name=f"annotated_{safe_stem(src_name)}.png",
+    mime="image/png",
+)
+e2.download_button(
+    "⬇️ JSON",
+    safe_json(export),
+    file_name=f"measure_{safe_stem(src_name)}.json",
+    mime="application/json",
+)
+if HAS_XLSX:
+    e3.download_button(
+        "⬇️ Excel (.xlsx)",
+        build_xlsx(export),
+        file_name=f"measure_{safe_stem(src_name)}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+else:
+    e3.download_button(
+        "⬇️ CSV",
+        build_csv(export),
+        file_name=f"measure_{safe_stem(src_name)}.csv",
+        mime="text/csv",
+    )
