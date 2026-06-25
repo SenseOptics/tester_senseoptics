@@ -1,25 +1,17 @@
 from __future__ import annotations
 # ════════════════════════════════════════════════════════════════════════
 #  SenseOptics Метролог — Replit/mobile friendly версия
-#  v5: пакетный режим ROI с отложенным расчётом (batch ROI / lazy metrics).
-#
-#  Главная идея версии:
-#    • клик НИЧЕГО не считает — он только накапливает точки/ROI;
-#    • метрики, overlay и экспорт строятся ТОЛЬКО по кнопке «Посчитать метрики»;
-#    • маска строится ТОЛЬКО по своей кнопке;
-#    • тяжёлые операции (Excel, JSON, PNG, ZIP, resize, mask) не выполняются
-#      после каждого rerun — это и даёт ускорение на бесплатном Replit.
+#  Лёгкий геометрический метрологический инструмент:
+#  линия/диаметр, окружность, площадь, ручной счётчик включений,
+#  калибровка по двум кликам, маска включений, экспорт PNG/JSON/XLSX/CSV.
 # ════════════════════════════════════════════════════════════════════════
 import hashlib
-import importlib.util
 import io
 import json
 import math
 import re
-import zipfile
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
@@ -33,9 +25,11 @@ except Exception:
     st_imgcoords = None
     HAS_CLICK = False
 
-# openpyxl импортируется ЛЕНИВО внутри build_xlsx_from_metrics().
-# Здесь только проверяем наличие пакета, не загружая его.
-HAS_XLSX = importlib.util.find_spec("openpyxl") is not None
+try:
+    from openpyxl import Workbook
+    HAS_XLSX = True
+except Exception:
+    HAS_XLSX = False
 
 st.set_page_config(
     page_title="SenseOptics Метролог",
@@ -44,23 +38,15 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-APP_VERSION = "app334-mobile-hotfix-v5-batch-roi-replit-free-2026-06-24"
-
-# Режимы (внутренние константы, чтобы не сравнивать строки по всему коду)
-MODE_LINE = "Линия"
-MODE_CIRCLE = "Окружность (3 точки)"
-MODE_POLY = "Площадь (полигон)"
-MODE_INCL = "Включения"
-MODE_MASK = "ROI маски"
-MODE_CALIB = "Калибровка"
-MODES = [MODE_LINE, MODE_CIRCLE, MODE_POLY, MODE_INCL, MODE_MASK, MODE_CALIB]
+MODES = ["Линия / диаметр", "Окружность", "Площадь", "Включения", "Калибровка (2 клика)"]
 
 GREEN = (40, 180, 70)
 BLUE = (40, 120, 230)
 ORANGE = (255, 150, 0)
 RED = (220, 50, 50)
-PURPLE = (165, 80, 205)
 BLACK = (20, 20, 20)
+
+APP_VERSION = "app334-mobile-hotfix-v6-immediate-calc-lazy-export-2026-06-25"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -68,42 +54,31 @@ BLACK = (20, 20, 20)
 # ════════════════════════════════════════════════════════════════════════
 def _init_state() -> None:
     defaults = {
-        # --- пакетный ROI ---
-        "draft_points": [],        # точки текущего незавершённого ROI
-        "draft_rois": [],          # накопленные ROI (ещё не обязательно рассчитаны)
-        "measurements": [],        # рассчитанные метрики (= cached_metrics["measurements"])
-        "metrics_dirty": False,    # True, если ROI менялись и нужен пересчёт
-        "cached_metrics": None,    # последний результат calculate_all_metrics
-        "cached_overlay": None,    # overlay (RGB) после расчёта
-        "cached_exports": None,    # кэш лёгких экспортов после расчёта
-        "current_image_id": None,  # идентификатор текущего изображения
-        "last_uploaded_path": None,  # путь к последнему сохранённому файлу в uploads
-        "roi_counter": 0,          # для уникальных id ROI
-
-        # --- калибровка ---
+        "meas": [],
+        "pending": [],
+        "inclusions": [],
+        "calib_pts": [],
         "px_per_mm": None,
-        "calibration_info": None,
-
-        # --- клики/режим/полноэкранный ---
         "last_click_id": None,
+        "image_state_key": None,
         "fullscreen_mode": False,
-        "canvas_display_width": 420,
-        "inclusion_fast_mode": True,
-        "mask_roi_shape": "polygon",
-        "show_control_preview_v5": False,
-
-        # --- маска ---
         "mask": None,
         "mask_overlay": None,
         "mask_stats": None,
         "mask_settings": None,
-
-        # --- надёжное хранение изображения (file_uploader на телефоне/Replit
-        #     иногда теряет файл при rerun) ---
+        # Надёжное хранение последнего изображения: file_uploader в мобильном браузере/Replit
+        # иногда теряет объект файла при rerun. Поэтому после первой успешной загрузки
+        # держим bytes в session_state и дополнительно сохраняем копию на диск Replit.
         "stored_image_bytes": None,
         "stored_image_name": None,
         "stored_image_id": None,
         "stored_image_source": None,
+        "force_static_preview": False,
+        "show_control_preview_v4": False,
+        "canvas_display_width": 720,
+        # Кэш готовых файлов экспорта. Тяжёлые файлы (PNG/JSON/Excel/CSV) больше не
+        # пересобираются на каждый клик — только по кнопке «Подготовить файлы».
+        "export_cache": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -117,21 +92,17 @@ def reset_mask() -> None:
     st.session_state.mask_settings = None
 
 
-def clear_work_state(reset_calibration: bool = True) -> None:
-    """Полная очистка рабочего состояния (при смене изображения/ширины)."""
-    st.session_state.draft_points = []
-    st.session_state.draft_rois = []
-    st.session_state.measurements = []
-    st.session_state.cached_metrics = None
-    st.session_state.cached_overlay = None
-    st.session_state.cached_exports = None
-    st.session_state.metrics_dirty = False
+def reset_work(reset_calibration: bool = True, reset_mask_data: bool = True) -> None:
+    st.session_state.meas = []
+    st.session_state.pending = []
+    st.session_state.inclusions = []
+    st.session_state.calib_pts = []
     st.session_state.last_click_id = None
-    st.session_state.roi_counter = 0
-    reset_mask()
+    st.session_state.export_cache = None
     if reset_calibration:
         st.session_state.px_per_mm = None
-        st.session_state.calibration_info = None
+    if reset_mask_data:
+        reset_mask()
 
 
 _init_state()
@@ -210,16 +181,6 @@ st.markdown(
         font-size: 0.84rem;
         line-height: 1.35;
     }
-    .so-status {
-        padding: 0.5rem 0.75rem;
-        border-radius: 10px;
-        background: rgba(40, 120, 230, 0.10);
-        font-size: 0.9rem;
-        margin: 0.25rem 0 0.5rem 0;
-    }
-    .so-dirty {
-        background: rgba(255, 150, 0, 0.16) !important;
-    }
     .so-version {
         opacity: 0.55;
         font-size: 0.78rem;
@@ -240,7 +201,7 @@ st.markdown(
             min-height: 46px;
             font-size: 0.88rem;
         }
-        /* Streamlit columns иногда не успевают схлопнуться внутри Replit WebView.
+        /* Streamlit columns иногда не успевают нормально схлопнуться внутри Replit WebView.
            Это заставляет колонки идти одной под другой и убирает горизонтальный скролл. */
         div[data-testid="stHorizontalBlock"] {
             flex-wrap: wrap !important;
@@ -257,7 +218,7 @@ st.markdown(
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  Геометрия (чистые функции, без Streamlit)
+#  Геометрия
 # ════════════════════════════════════════════════════════════════════════
 def dist(a, b) -> float:
     return math.hypot(b[0] - a[0], b[1] - a[1])
@@ -280,260 +241,101 @@ def poly_perimeter(pts) -> float:
     return sum(dist(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts)))
 
 
-def circumcircle(p1, p2, p3) -> Tuple[Optional[Tuple[float, float]], Optional[float]]:
-    """Окружность по трём точкам. Возвращает (center, radius) или (None, None) для коллинеарных."""
-    ax, ay = float(p1[0]), float(p1[1])
-    bx, by = float(p2[0]), float(p2[1])
-    cx, cy = float(p3[0]), float(p3[1])
-    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
-    if abs(d) < 1e-9:
-        return None, None
-    a2 = ax * ax + ay * ay
-    b2 = bx * bx + by * by
-    c2 = cx * cx + cy * cy
-    ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d
-    uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d
-    r = math.hypot(ax - ux, ay - uy)
-    return (ux, uy), r
+def measure_metrics(m: Dict[str, Any], ppm: Optional[float]) -> Dict[str, Any]:
+    t = m["type"]
+    out: Dict[str, Any] = {"type": t}
+    if t == "line":
+        d = dist(m["p1"], m["p2"])
+        out["length_px"] = round(d, 2)
+        out["length_mm"] = round(d / ppm, 3) if ppm else None
+    elif t == "circle":
+        r = dist(m["center"], m["edge"])
+        out["radius_px"] = round(r, 2)
+        out["diameter_px"] = round(2 * r, 2)
+        out["circumference_px"] = round(2 * math.pi * r, 2)
+        out["area_px2"] = round(math.pi * r * r, 1)
+        if ppm:
+            out["radius_mm"] = round(r / ppm, 3)
+            out["diameter_mm"] = round(2 * r / ppm, 3)
+            out["circumference_mm"] = round(2 * math.pi * r / ppm, 3)
+            out["area_mm2"] = round(math.pi * r * r / (ppm * ppm), 4)
+    elif t == "polygon":
+        a = poly_area(m["pts"])
+        p = poly_perimeter(m["pts"])
+        out["area_px2"] = round(a, 1)
+        out["perimeter_px"] = round(p, 2)
+        out["n_vertices"] = len(m["pts"])
+        if ppm:
+            out["area_mm2"] = round(a / (ppm * ppm), 4)
+            out["perimeter_mm"] = round(p / ppm, 3)
+    return out
 
 
-# ════════════════════════════════════════════════════════════════════════
-#  Расчёт всех метрик (ТОЛЬКО по кнопке)
-# ════════════════════════════════════════════════════════════════════════
-def calculate_all_metrics(
-    draft_rois: List[Dict[str, Any]],
-    px_per_mm: Optional[float],
-    image_shape: Tuple[int, int],
-    mask: Optional[np.ndarray] = None,
-) -> Dict[str, Any]:
-    """Единая точка расчёта. Считает метрики по всем накопленным ROI."""
-    H, W = int(image_shape[0]), int(image_shape[1])
-    measurements: List[Dict[str, Any]] = []
-    warnings: List[str] = []
-    n_inclusions = 0
-    total_line_mm = 0.0
-    analysis_area_px = 0.0  # суммарная площадь mask_roi/polygon для плотности включений
-
-    for roi in draft_rois:
-        t = roi.get("type")
-        pts = roi.get("points", [])
-        rec: Dict[str, Any] = {
-            "id": roi.get("id"),
-            "type": t,
-            "label": roi.get("label", ""),
-            "points": pts,
-        }
-
-        if t == "line":
-            if len(pts) < 2:
-                warnings.append(f"{roi.get('id')}: для линии нужно 2 точки.")
-                continue
-            d = dist(pts[0], pts[1])
-            rec["length_px"] = round(d, 2)
-            if px_per_mm:
-                rec["length_mm"] = round(d / px_per_mm, 4)
-                total_line_mm += rec["length_mm"]
-
-        elif t == "circle_3pt":
-            if len(pts) < 3:
-                warnings.append(f"{roi.get('id')}: для окружности нужно 3 точки.")
-                continue
-            center, r = circumcircle(pts[0], pts[1], pts[2])
-            if center is None:
-                warnings.append(f"{roi.get('id')}: 3 точки на одной прямой — окружность не построена.")
-                continue
-            rec["center_x"] = round(center[0], 2)
-            rec["center_y"] = round(center[1], 2)
-            rec["radius_px"] = round(r, 2)
-            rec["diameter_px"] = round(2 * r, 2)
-            rec["circumference_px"] = round(2 * math.pi * r, 2)
-            rec["area_px2"] = round(math.pi * r * r, 1)
-            if px_per_mm:
-                rec["radius_mm"] = round(r / px_per_mm, 4)
-                rec["diameter_mm"] = round(2 * r / px_per_mm, 4)
-                rec["circumference_mm"] = round(2 * math.pi * r / px_per_mm, 4)
-                rec["area_mm2"] = round(math.pi * r * r / (px_per_mm * px_per_mm), 4)
-
-        elif t == "polygon":
-            if len(pts) < 3:
-                warnings.append(f"{roi.get('id')}: для полигона нужно минимум 3 точки.")
-                continue
-            a = poly_area(pts)
-            p = poly_perimeter(pts)
-            analysis_area_px += a
-            rec["area_px2"] = round(a, 1)
-            rec["perimeter_px"] = round(p, 2)
-            rec["n_vertices"] = len(pts)
-            if px_per_mm:
-                rec["area_mm2"] = round(a / (px_per_mm * px_per_mm), 4)
-                rec["perimeter_mm"] = round(p / px_per_mm, 4)
-
-        elif t == "inclusion_point":
-            if not pts:
-                continue
-            n_inclusions += 1
-            rec["x"] = int(pts[0][0])
-            rec["y"] = int(pts[0][1])
-
-        elif t == "mask_roi":
-            if len(pts) < 3:
-                warnings.append(f"{roi.get('id')}: для ROI маски нужно минимум 3 точки.")
-                continue
-            a = poly_area(pts)
-            analysis_area_px += a
-            rec["roi_area_px2"] = round(a, 1)
-            if px_per_mm:
-                rec["roi_area_mm2"] = round(a / (px_per_mm * px_per_mm), 4)
-            if mask is not None and a > 0:
-                poly_mask = np.zeros((H, W), np.uint8)
-                cv2.fillPoly(poly_mask, [np.array(pts, np.int32)], 255)
-                inside = int(np.count_nonzero((mask > 0) & (poly_mask > 0)))
-                rec["mask_px_inside"] = inside
-                rec["mask_percent_inside"] = round(100.0 * inside / a, 3)
-                rec["mask_fraction_inside"] = round(inside / a, 5)
-                if px_per_mm:
-                    rec["mask_area_inside_mm2"] = round(inside / (px_per_mm * px_per_mm), 5)
-        else:
-            warnings.append(f"{roi.get('id')}: неизвестный тип ROI '{t}'.")
-            continue
-
-        measurements.append(rec)
-
-    summary = {
-        "n_rois": len(draft_rois),
-        "n_lines": sum(1 for r in draft_rois if r.get("type") == "line"),
-        "n_circles": sum(1 for r in draft_rois if r.get("type") == "circle_3pt"),
-        "n_polygons": sum(1 for r in draft_rois if r.get("type") == "polygon"),
-        "n_inclusions": n_inclusions,
-        "n_mask_rois": sum(1 for r in draft_rois if r.get("type") == "mask_roi"),
-        "px_per_mm": px_per_mm,
-        "total_line_length_mm": round(total_line_mm, 4) if px_per_mm else None,
-    }
-
-    statistics: Dict[str, Any] = {}
-    if n_inclusions and analysis_area_px > 0 and px_per_mm:
-        area_mm2 = analysis_area_px / (px_per_mm * px_per_mm)
-        statistics["analysis_area_mm2"] = round(area_mm2, 4)
-        statistics["inclusion_density_per_mm2"] = (
-            round(n_inclusions / area_mm2, 4) if area_mm2 > 0 else None
-        )
-    elif n_inclusions:
-        statistics["note"] = (
-            "Для плотности включений задайте калибровку и хотя бы один полигон / ROI области анализа."
-        )
-
-    return {
-        "measurements": measurements,
-        "summary": summary,
-        "statistics": statistics,
-        "warnings": warnings,
-    }
+def short_label(m: Dict[str, Any], ppm: Optional[float]) -> str:
+    mm = measure_metrics(m, ppm)
+    if m["type"] == "line":
+        return f"{mm['length_mm']} мм" if ppm else f"{mm['length_px']} px"
+    if m["type"] == "circle":
+        return f"D {mm['diameter_mm']} мм" if ppm else f"D {mm['diameter_px']} px"
+    if m["type"] == "polygon":
+        return f"{mm['area_mm2']} мм²" if ppm else f"{mm['area_px2']} px²"
+    return ""
 
 
 # ════════════════════════════════════════════════════════════════════════
 #  Отрисовка
 # ════════════════════════════════════════════════════════════════════════
 def _put(img, text, org, color) -> None:
-    if not text:
-        return
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
 
 
-def draw_workspace(
-    work_bgr: np.ndarray,
-    draft_rois: List[Dict[str, Any]],
-    draft_points: List[List[int]],
-    mode: str,
-    measurements: Optional[List[Dict[str, Any]]] = None,
-) -> np.ndarray:
-    """
-    Лёгкая отрисовка. Если measurements не передан — рисуем только фигуры и имена
-    (без расчётов), что делает перерисовку после каждого клика дешёвой.
-    Если measurements передан (уже посчитан и закэширован) — добавляем значения.
-    Никаких пересчётов метрик здесь не происходит.
-    """
+def draw_overlay(work_bgr, meas, pending, inclusions, calib_pts, ppm, mode) -> np.ndarray:
     rgb = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2RGB).copy()
-    meas_by_id = {m.get("id"): m for m in (measurements or [])}
-    incl_n = 0
 
-    for roi in draft_rois:
-        t = roi.get("type")
-        pts = roi.get("points", [])
-        m = meas_by_id.get(roi.get("id"))
-
-        if t == "line" and len(pts) >= 2:
-            p1, p2 = tuple(pts[0]), tuple(pts[1])
+    for m in meas:
+        if m["type"] == "line":
+            p1, p2 = tuple(m["p1"]), tuple(m["p2"])
             cv2.line(rgb, p1, p2, GREEN, 2)
             cv2.circle(rgb, p1, 4, GREEN, -1)
             cv2.circle(rgb, p2, 4, GREEN, -1)
-            label = roi.get("label", "")
-            if m is not None:
-                label = (
-                    f"{m.get('length_mm')} мм" if m.get("length_mm") is not None
-                    else f"{m.get('length_px')} px"
-                )
             mx, my = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
-            _put(rgb, label, (mx + 5, my - 7), GREEN)
+            _put(rgb, short_label(m, ppm), (mx + 5, my - 7), GREEN)
+        elif m["type"] == "circle":
+            c = tuple(m["center"])
+            r = int(round(dist(m["center"], m["edge"])))
+            cv2.circle(rgb, c, r, BLUE, 2)
+            cv2.circle(rgb, c, 4, BLUE, -1)
+            cv2.line(rgb, c, tuple(m["edge"]), BLUE, 1)
+            _put(rgb, short_label(m, ppm), (c[0] + 5, max(15, c[1] - r - 7)), BLUE)
+        elif m["type"] == "polygon":
+            pts = np.array(m["pts"], np.int32)
+            cv2.polylines(rgb, [pts], True, ORANGE, 2)
+            for p in m["pts"]:
+                cv2.circle(rgb, tuple(p), 4, ORANGE, -1)
+            cx = int(np.mean([p[0] for p in m["pts"]]))
+            cy = int(np.mean([p[1] for p in m["pts"]]))
+            _put(rgb, short_label(m, ppm), (cx + 5, cy), ORANGE)
 
-        elif t == "circle_3pt" and len(pts) >= 3:
-            center, r = circumcircle(pts[0], pts[1], pts[2])
-            if center is not None:
-                c = (int(round(center[0])), int(round(center[1])))
-                ri = int(round(r))
-                cv2.circle(rgb, c, ri, BLUE, 2)
-                cv2.circle(rgb, c, 3, BLUE, -1)
-                for p in pts:
-                    cv2.circle(rgb, tuple(p), 4, BLUE, -1)
-                label = roi.get("label", "")
-                if m is not None:
-                    label = (
-                        f"D {m.get('diameter_mm')} мм" if m.get("diameter_mm") is not None
-                        else f"D {m.get('diameter_px')} px"
-                    )
-                _put(rgb, label, (c[0] + 5, max(15, c[1] - ri - 7)), BLUE)
-            else:
-                for p in pts:
-                    cv2.circle(rgb, tuple(p), 4, RED, 2)
+    for i, (x, y) in enumerate(inclusions):
+        cv2.circle(rgb, (x, y), 8, RED, 2)
+        _put(rgb, str(i + 1), (x + 10, y - 6), RED)
 
-        elif t in ("polygon", "mask_roi") and len(pts) >= 2:
-            col = ORANGE if t == "polygon" else PURPLE
-            arr = np.array(pts, np.int32)
-            cv2.polylines(rgb, [arr], True, col, 2)
-            for p in pts:
-                cv2.circle(rgb, tuple(p), 4, col, -1)
-            cx = int(np.mean([p[0] for p in pts]))
-            cy = int(np.mean([p[1] for p in pts]))
-            label = roi.get("label", "")
-            if m is not None and t == "polygon":
-                label = (
-                    f"{m.get('area_mm2')} мм²" if m.get("area_mm2") is not None
-                    else f"{m.get('area_px2')} px²"
-                )
-            _put(rgb, label, (cx + 5, cy), col)
-
-        elif t == "inclusion_point" and pts:
-            incl_n += 1
-            x, y = int(pts[0][0]), int(pts[0][1])
-            cv2.circle(rgb, (x, y), 8, RED, 2)
-            _put(rgb, str(incl_n), (x + 10, y - 6), RED)
-
-    # Черновые точки текущего ROI
-    for p in draft_points:
+    for p in pending:
         cv2.drawMarker(rgb, tuple(p), BLACK, cv2.MARKER_CROSS, 14, 2)
-    if mode in (MODE_POLY, MODE_MASK) and len(draft_points) >= 2:
-        cv2.polylines(rgb, [np.array(draft_points, np.int32)], False, ORANGE, 1)
-    if mode == MODE_CALIB:
-        for i, p in enumerate(draft_points):
-            cv2.circle(rgb, tuple(p), 9, ORANGE, 2)
-            _put(rgb, f"C{i + 1}", (p[0] + 10, p[1] - 6), ORANGE)
-        if len(draft_points) == 2:
-            cv2.line(rgb, tuple(draft_points[0]), tuple(draft_points[1]), ORANGE, 1)
+    if mode == "Площадь" and len(pending) >= 2:
+        cv2.polylines(rgb, [np.array(pending, np.int32)], False, ORANGE, 1)
+
+    for i, (x, y) in enumerate(calib_pts):
+        cv2.circle(rgb, (x, y), 9, ORANGE, 2)
+        _put(rgb, f"C{i + 1}", (x + 10, y - 6), ORANGE)
+    if len(calib_pts) == 2:
+        cv2.line(rgb, tuple(calib_pts[0]), tuple(calib_pts[1]), ORANGE, 1)
 
     return rgb
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  Загрузка / декодирование (кэшируется)
+#  Загрузка / декодирование
 # ════════════════════════════════════════════════════════════════════════
 def file_fingerprint(data: bytes, name: str) -> str:
     h = hashlib.sha1()
@@ -544,12 +346,13 @@ def file_fingerprint(data: bytes, name: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def decode_image(data: bytes, name: str = "") -> Tuple[Optional[np.ndarray], Optional[str]]:
-    """BGR OpenCV. Сначала OpenCV, затем Pillow fallback для проблемных TIFF/PNG."""
+def decode_image(data: bytes, name: str = "") -> tuple[Optional[np.ndarray], Optional[str]]:
+    """Возвращает BGR OpenCV. Сначала OpenCV, затем Pillow fallback для проблемных TIFF/PNG."""
     arr = np.frombuffer(data, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is not None:
         return img, None
+
     try:
         pil = PILImage.open(io.BytesIO(data))
         pil = ImageOps.exif_transpose(pil)
@@ -561,7 +364,7 @@ def decode_image(data: bytes, name: str = "") -> Tuple[Optional[np.ndarray], Opt
 
 
 @st.cache_data(show_spinner=False)
-def cached_downscale(img: np.ndarray, max_w: int) -> Tuple[np.ndarray, float]:
+def cached_downscale(img: np.ndarray, max_w: int) -> tuple[np.ndarray, float]:
     h, w = img.shape[:2]
     if w <= max_w:
         return img.copy(), 1.0
@@ -571,26 +374,11 @@ def cached_downscale(img: np.ndarray, max_w: int) -> Tuple[np.ndarray, float]:
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  Маска тёмных/светлых включений (строится ТОЛЬКО по кнопке)
+#  Маска тёмных/светлых включений
 # ════════════════════════════════════════════════════════════════════════
 def _odd(v: int) -> int:
     v = int(v)
     return v if v % 2 == 1 else v + 1
-
-
-def _mask_roi_region(work_bgr: np.ndarray, mask_rois: List[Dict[str, Any]]) -> Optional[np.ndarray]:
-    """Бинарная область из mask_roi полигонов или None, если их нет."""
-    if not mask_rois:
-        return None
-    h, w = work_bgr.shape[:2]
-    region = np.zeros((h, w), np.uint8)
-    drew = False
-    for roi in mask_rois:
-        pts = roi.get("points", [])
-        if len(pts) >= 3:
-            cv2.fillPoly(region, [np.array(pts, np.int32)], 255)
-            drew = True
-    return region if drew else None
 
 
 def build_inclusion_mask(
@@ -602,7 +390,6 @@ def build_inclusion_mask(
     detect_bright: bool = False,
     blur_size: int = 3,
     close_iter: int = 1,
-    region: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     gray = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2GRAY)
     if blur_size > 1:
@@ -616,10 +403,6 @@ def build_inclusion_mask(
             mask = (gray >= int(manual_threshold)).astype(np.uint8) * 255
         else:
             mask = (gray <= int(manual_threshold)).astype(np.uint8) * 255
-
-    # Ограничиваем маску областью mask_roi, если она задана
-    if region is not None:
-        mask = cv2.bitwise_and(mask, region)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -650,7 +433,7 @@ def make_mask_overlay(work_bgr: np.ndarray, mask: np.ndarray, alpha: float = 0.4
 def mask_stats(mask: np.ndarray, ppm: Optional[float]) -> Dict[str, Any]:
     n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     areas = [int(stats[label, cv2.CC_STAT_AREA]) for label in range(1, n)]
-    total_px = int(np.count_nonzero(mask > 0))
+    total_px = int(np.sum(mask > 0))
     out: Dict[str, Any] = {
         "n_objects": n - 1,
         "total_mask_px": total_px,
@@ -667,11 +450,6 @@ def mask_stats(mask: np.ndarray, ppm: Optional[float]) -> Dict[str, Any]:
 
 def gray_png_bytes(gray: np.ndarray) -> bytes:
     ok, buf = cv2.imencode(".png", gray)
-    return buf.tobytes() if ok else b""
-
-
-def png_bytes(rgb) -> bytes:
-    ok, buf = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
     return buf.tobytes() if ok else b""
 
 
@@ -708,7 +486,7 @@ def save_last_image(data: bytes, name: str, file_id: str) -> Optional[str]:
         return None
 
 
-def load_last_image_from_disk() -> Tuple[Optional[bytes], Optional[str], Optional[str], Optional[str]]:
+def load_last_image_from_disk() -> tuple[Optional[bytes], Optional[str], Optional[str], Optional[str]]:
     try:
         if not LATEST_JSON.exists():
             return None, None, None, None
@@ -733,12 +511,11 @@ def remember_image(data: bytes, name: str, source: str = "upload") -> str:
     disk_path = save_last_image(data, name, file_id)
     if disk_path:
         st.session_state.stored_image_source = f"{source}+disk"
-        st.session_state.last_uploaded_path = disk_path
     return file_id
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  Экспорт (строится только после расчёта / по кнопке)
+#  Экспорт
 # ════════════════════════════════════════════════════════════════════════
 class _NpEncoder(json.JSONEncoder):
     def default(self, o):
@@ -751,334 +528,200 @@ class _NpEncoder(json.JSONEncoder):
         return super().default(o)
 
 
-def safe_json(d) -> str:
-    return json.dumps(d, ensure_ascii=False, indent=2, cls=_NpEncoder)
-
-
 def safe_stem(name: str) -> str:
     return Path(name).stem.replace(" ", "_") or "image"
 
 
-def build_project_json(
-    src_name: str,
-    work_shape: Tuple[int, int],
-    work_width: int,
-    ppm: Optional[float],
-    calibration_info: Optional[Dict[str, Any]],
-    draft_rois: List[Dict[str, Any]],
-    metrics: Optional[Dict[str, Any]],
-    mask_settings: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Лёгкий JSON проекта. Без изображения и без base64."""
-    metrics = metrics or {}
+def build_export(src, W, H, ppm, meas, inclusions, scale, mask_info=None) -> Dict[str, Any]:
     return {
-        "version": APP_VERSION,
-        "image_name": src_name,
-        "image_shape": [int(work_shape[0]), int(work_shape[1])],
-        "work_width": int(work_width),
-        "px_per_mm": ppm,
-        "calibration_info": calibration_info,
-        "draft_rois": draft_rois,
-        "measurements": metrics.get("measurements", []),
-        "mask_parameters": mask_settings,
-        "summary": metrics.get("summary", {}),
-        "statistics": metrics.get("statistics", {}),
+        "source": src,
+        "working_size_px": [W, H],
+        "display_scale_from_original": scale,
+        "px_per_mm_working_image": ppm,
+        "measurements": [{**measure_metrics(m, ppm), "raw": m} for m in meas],
+        "inclusions": {
+            "count": len(inclusions),
+            "points": [{"n": i + 1, "x": int(x), "y": int(y)} for i, (x, y) in enumerate(inclusions)],
+        },
+        "mask": mask_info,
     }
 
 
-CSV_KEYS = [
-    "id", "label", "type",
-    "length_px", "length_mm",
-    "diameter_px", "diameter_mm", "radius_px", "radius_mm",
-    "circumference_px", "circumference_mm",
-    "perimeter_px", "perimeter_mm",
-    "area_px2", "area_mm2",
-    "center_x", "center_y", "x", "y",
-    "roi_area_px2", "roi_area_mm2", "mask_px_inside", "mask_percent_inside",
-]
+def safe_json(d) -> str:
+    return json.dumps(d, ensure_ascii=False, indent=2, cls=_NpEncoder)
 
 
-def build_csv_from_metrics(metrics: Optional[Dict[str, Any]]) -> str:
-    metrics = metrics or {}
-    lines = [",".join(CSV_KEYS)]
-    for m in metrics.get("measurements", []):
-        lines.append(",".join(str(m.get(k, "")) for k in CSV_KEYS))
-    lines.append("")
-    for k, v in (metrics.get("summary") or {}).items():
-        lines.append(f"summary_{k},{v}")
-    for k, v in (metrics.get("statistics") or {}).items():
-        lines.append(f"stat_{k},{v}")
-    return "\n".join(lines)
-
-
-def build_xlsx_from_metrics(metrics: Optional[Dict[str, Any]], project: Dict[str, Any]) -> bytes:
-    from openpyxl import Workbook  # ленивый импорт
-
-    metrics = metrics or {}
+def build_xlsx(export) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "Замеры"
-    ws.append(CSV_KEYS)
-    for m in metrics.get("measurements", []):
-        ws.append([m.get(k) for k in CSV_KEYS])
-
-    ws_sum = wb.create_sheet("Сводка")
-    for k, v in (metrics.get("summary") or {}).items():
-        ws_sum.append([k, v])
-
-    ws_stat = wb.create_sheet("Статистика")
-    for k, v in (metrics.get("statistics") or {}).items():
-        ws_stat.append([k, v])
-
+    ws.append([
+        "Тип", "Длина_px", "Длина_mm", "Диаметр_px", "Диаметр_mm",
+        "Окружность_px", "Окружность_mm", "Периметр_px", "Периметр_mm",
+        "Площадь_px2", "Площадь_mm2",
+    ])
+    for m in export["measurements"]:
+        ws.append([
+            m.get("type"),
+            m.get("length_px"), m.get("length_mm"),
+            m.get("diameter_px"), m.get("diameter_mm"),
+            m.get("circumference_px"), m.get("circumference_mm"),
+            m.get("perimeter_px"), m.get("perimeter_mm"),
+            m.get("area_px2"), m.get("area_mm2"),
+        ])
     ws_info = wb.create_sheet("Инфо")
-    for k in ("version", "image_name", "work_width", "px_per_mm"):
-        ws_info.append([k, project.get(k)])
-    if metrics.get("warnings"):
-        ws_info.append([])
-        ws_info.append(["warnings"])
-        for w in metrics["warnings"]:
-            ws_info.append([w])
+    for k, v in [
+        ("source", export["source"]),
+        ("working_w_px", export["working_size_px"][0]),
+        ("working_h_px", export["working_size_px"][1]),
+        ("display_scale_from_original", export["display_scale_from_original"]),
+        ("px_per_mm_working_image", export["px_per_mm_working_image"]),
+    ]:
+        ws_info.append([k, v])
+
+    ws_inc = wb.create_sheet("Включения")
+    ws_inc.append(["№", "x", "y"])
+    for p in export["inclusions"]["points"]:
+        ws_inc.append([p["n"], p["x"], p["y"]])
+    ws_inc.append([])
+    ws_inc.append(["Всего", export["inclusions"]["count"]])
+
+    ws_mask = wb.create_sheet("Маска")
+    mask_info = export.get("mask") or {}
+    if mask_info:
+        for k, v in mask_info.items():
+            ws_mask.append([k, json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v])
+    else:
+        ws_mask.append(["mask", "not built"])
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-def build_project_zip(
-    image_data: bytes,
-    src_name: str,
-    project: Dict[str, Any],
-    metrics: Optional[Dict[str, Any]],
-    overlay_rgb: Optional[np.ndarray],
-    mask: Optional[np.ndarray],
-    mask_overlay_rgb: Optional[np.ndarray],
-) -> bytes:
-    """ZIP проекта. Изображение кладём как файл (без base64)."""
-    buf = io.BytesIO()
-    ext = (Path(src_name).suffix or ".png").lower()
-    if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"):
-        ext = ".png"
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        if image_data:
-            z.writestr(f"image{ext}", image_data)
-        z.writestr("metrology_project.json", safe_json(project))
-        if HAS_XLSX and metrics:
-            z.writestr("measurements.xlsx", build_xlsx_from_metrics(metrics, project))
-        else:
-            z.writestr("measurements.csv", build_csv_from_metrics(metrics))
-        if overlay_rgb is not None:
-            z.writestr("overlay.png", png_bytes(overlay_rgb))
-        if mask is not None:
-            z.writestr("mask.png", gray_png_bytes(mask))
-        if mask_overlay_rgb is not None:
-            z.writestr("mask_overlay.png", png_bytes(mask_overlay_rgb))
-    return buf.getvalue()
+def build_csv(export) -> str:
+    lines = [
+        "type,length_px,length_mm,diameter_px,diameter_mm,circumference_px,"
+        "circumference_mm,perimeter_px,perimeter_mm,area_px2,area_mm2"
+    ]
+    keys = [
+        "type", "length_px", "length_mm", "diameter_px", "diameter_mm",
+        "circumference_px", "circumference_mm", "perimeter_px", "perimeter_mm",
+        "area_px2", "area_mm2",
+    ]
+    for m in export["measurements"]:
+        lines.append(",".join(str(m.get(k, "")) for k in keys))
+    lines.append("")
+    lines.append(f"inclusions_count,{export['inclusions']['count']}")
+    lines.append(f"px_per_mm_working_image,{export['px_per_mm_working_image']}")
+    if export.get("mask"):
+        lines.append("")
+        for k, v in export["mask"].items():
+            lines.append(f"mask_{k},{v}")
+    return "\n".join(lines)
+
+
+def png_bytes(rgb) -> bytes:
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    return buf.tobytes() if ok else b""
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  ROI / клики (НИЧЕГО не считают)
+#  Клики
 # ════════════════════════════════════════════════════════════════════════
-_TYPE_NAMES = {
-    "line": "Line",
-    "circle_3pt": "Circle",
-    "polygon": "Polygon",
-    "inclusion_point": "Inclusion",
-    "mask_roi": "Mask ROI",
-}
-
-
-def _type_label(roi_type: str) -> str:
-    base = _TYPE_NAMES.get(roi_type, roi_type)
-    n = sum(1 for r in st.session_state.draft_rois if r.get("type") == roi_type) + 1
-    return f"{base} {n}"
-
-
-def make_roi(roi_type: str, points, closed: Optional[bool] = None, label: Optional[str] = None) -> Dict[str, Any]:
-    st.session_state.roi_counter += 1
-    rid = f"roi_{st.session_state.roi_counter:04d}"
-    roi: Dict[str, Any] = {
-        "id": rid,
-        "type": roi_type,
-        "points": [[int(round(p[0])), int(round(p[1]))] for p in points],
-        "label": label or _type_label(roi_type),
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    if closed is not None:
-        roi["closed"] = bool(closed)
-    return roi
-
-
-def add_roi(roi: Dict[str, Any]) -> None:
-    st.session_state.draft_rois.append(roi)
-    st.session_state.metrics_dirty = True
-
-
-def clamp_click(x: int, y: int, W: int, H: int) -> Tuple[int, int]:
+def clamp_click(x: int, y: int, W: int, H: int) -> tuple[int, int]:
     return max(0, min(W - 1, x)), max(0, min(H - 1, y))
 
 
 def handle_click(x: int, y: int, mode: str) -> None:
-    """Только накопление точек/ROI. Никаких метрик."""
-    if mode == MODE_INCL and st.session_state.inclusion_fast_mode:
-        add_roi(make_roi("inclusion_point", [[x, y]]))
-        return
-    if mode == MODE_CALIB:
-        if len(st.session_state.draft_points) >= 2:
-            st.session_state.draft_points = [[x, y]]
+    if mode == "Линия / диаметр":
+        st.session_state.pending.append([x, y])
+        if len(st.session_state.pending) == 2:
+            p1, p2 = st.session_state.pending
+            st.session_state.meas.append({"type": "line", "p1": p1, "p2": p2})
+            st.session_state.pending = []
+    elif mode == "Окружность":
+        st.session_state.pending.append([x, y])
+        if len(st.session_state.pending) == 2:
+            c, e = st.session_state.pending
+            st.session_state.meas.append({"type": "circle", "center": c, "edge": e})
+            st.session_state.pending = []
+    elif mode == "Площадь":
+        st.session_state.pending.append([x, y])
+    elif mode == "Включения":
+        st.session_state.inclusions.append((x, y))
+    elif mode == "Калибровка (2 клика)":
+        if len(st.session_state.calib_pts) >= 2:
+            st.session_state.calib_pts = [[x, y]]
         else:
-            st.session_state.draft_points.append([x, y])
-        return
-    st.session_state.draft_points.append([x, y])
+            st.session_state.calib_pts.append([x, y])
 
 
-def commit_draft(mode: str, mask_shape: str) -> Tuple[bool, Optional[str]]:
-    """Превращает накопленные draft_points в ROI. Возвращает (ok, error)."""
-    pts = st.session_state.draft_points
-    if mode == MODE_LINE:
-        if len(pts) != 2:
-            return False, "Для линии нужно ровно 2 точки."
-        add_roi(make_roi("line", pts))
-    elif mode == MODE_CIRCLE:
-        if len(pts) != 3:
-            return False, "Для окружности нужно ровно 3 точки."
-        add_roi(make_roi("circle_3pt", pts))
-    elif mode == MODE_POLY:
-        if len(pts) < 3:
-            return False, "Для полигона нужно минимум 3 точки."
-        add_roi(make_roi("polygon", pts, closed=True))
-    elif mode == MODE_INCL:
-        if len(pts) < 1:
-            return False, "Поставьте хотя бы одну точку включения."
-        for p in pts:
-            add_roi(make_roi("inclusion_point", [p]))
-    elif mode == MODE_MASK:
-        if mask_shape == "rect":
-            if len(pts) != 2:
-                return False, "Для прямоугольной ROI нужно 2 точки (противоположные углы)."
-            (x1, y1), (x2, y2) = pts
-            rect = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-            add_roi(make_roi("mask_roi", rect, closed=True))
-        else:
-            if len(pts) < 3:
-                return False, "Для полигональной ROI маски нужно минимум 3 точки."
-            add_roi(make_roi("mask_roi", pts, closed=True))
-    elif mode == MODE_CALIB:
-        return False, "Калибровка применяется кнопкой «Применить калибровку», а не как ROI."
-    st.session_state.draft_points = []
-    return True, None
-
-
-def undo_last_draft_point() -> bool:
-    if st.session_state.draft_points:
-        st.session_state.draft_points.pop()
+def undo_last_point(mode: str) -> bool:
+    if mode == "Калибровка (2 клика)" and st.session_state.calib_pts:
+        st.session_state.calib_pts.pop()
+        return True
+    if st.session_state.pending:
+        st.session_state.pending.pop()
+        return True
+    if mode == "Включения" and st.session_state.inclusions:
+        st.session_state.inclusions.pop()
         return True
     return False
-
-
-def delete_last_roi() -> bool:
-    if st.session_state.draft_rois:
-        st.session_state.draft_rois.pop()
-        st.session_state.metrics_dirty = True
-        return True
-    return False
-
-
-def run_calculation(work_bgr: np.ndarray, mode: str) -> None:
-    """Единственное место, где считаются метрики, overlay и лёгкие экспорты."""
-    H, W = work_bgr.shape[:2]
-    metrics = calculate_all_metrics(
-        st.session_state.draft_rois,
-        st.session_state.px_per_mm,
-        (H, W),
-        st.session_state.mask,
-    )
-    overlay_calc = draw_workspace(work_bgr, st.session_state.draft_rois, [], mode, metrics["measurements"])
-    project = build_project_json(
-        st.session_state.stored_image_name or "image",
-        (H, W),
-        W,
-        st.session_state.px_per_mm,
-        st.session_state.calibration_info,
-        st.session_state.draft_rois,
-        metrics,
-        st.session_state.mask_settings,
-    )
-    st.session_state.cached_metrics = metrics
-    st.session_state.measurements = metrics["measurements"]
-    st.session_state.cached_overlay = overlay_calc
-    st.session_state.cached_exports = {
-        "json": safe_json(project),
-        "csv": build_csv_from_metrics(metrics),
-        "overlay_png": png_bytes(overlay_calc),
-        "project": project,
-    }
-    st.session_state.metrics_dirty = False
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  UI: шапка
+#  UI: шапка и загрузка
 # ════════════════════════════════════════════════════════════════════════
 st.title("📐 SenseOptics Метролог")
-st.markdown(
-    f"<div class='so-version'>Версия: {APP_VERSION} · база: app334.py · пакетный ROI</div>",
-    unsafe_allow_html=True,
-)
+st.markdown(f"<div class='so-version'>Версия: {APP_VERSION} · база: app334.py</div>", unsafe_allow_html=True)
+st.caption("Лёгкий режим для Replit/free: замеры, калибровка, включения, маска и экспорт.")
 
-fullscreen = st.toggle("🔍 Полноразмерный режим замеров", key="fullscreen_mode")
+with st.container(border=True):
+    st.markdown("**1. Загрузка изображения**")
+    st.caption(
+        "Файл после успешной загрузки сохраняется в памяти сессии и в папке uploads на Replit. "
+        "Если мобильный браузер потеряет upload при перерисовке страницы, изображение будет восстановлено автоматически."
+    )
+    main_up = st.file_uploader(
+        "Перетащите файл сюда или нажмите Browse files",
+        type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
+        key="main_upload",
+        help="Загрузка теперь находится в основной области. Боковая панель не используется.",
+    )
 
-# ════════════════════════════════════════════════════════════════════════
-#  UI: загрузка (скрыта в полноэкранном режиме)
-# ════════════════════════════════════════════════════════════════════════
-main_up = None
-use_sample = False
-sample = Path(__file__).parent / "sample" / "demo_template.png"
-
-if not fullscreen:
-    st.caption("Лёгкий режим для Replit/free: накопление ROI, расчёт по кнопке, экспорт и маска.")
-    with st.container(border=True):
-        st.markdown("**1. Загрузка изображения**")
-        st.caption(
-            "После успешной загрузки файл хранится в памяти сессии и в папке uploads на Replit. "
-            "Если мобильный браузер потеряет upload при перерисовке, изображение восстановится автоматически."
-        )
-        main_up = st.file_uploader(
-            "Перетащите файл сюда или нажмите Browse files",
-            type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
-            key="main_upload",
-            help="Загрузка находится в основной области. Боковая панель не используется.",
-        )
-
-        c_last, c_clear = st.columns(2)
-        if c_last.button("🔁 Загрузить последнее сохранённое"):
-            data_disk, name_disk, fid_disk, path_disk = load_last_image_from_disk()
-            if data_disk and name_disk and fid_disk:
-                st.session_state.stored_image_bytes = data_disk
-                st.session_state.stored_image_name = name_disk
-                st.session_state.stored_image_id = fid_disk
-                st.session_state.stored_image_source = f"disk:{path_disk}"
-                st.session_state.last_uploaded_path = path_disk
-                st.rerun()
-            else:
-                st.warning("Последнее сохранённое изображение не найдено.")
-        if c_clear.button("🧹 Забыть изображение"):
-            st.session_state.stored_image_bytes = None
-            st.session_state.stored_image_name = None
-            st.session_state.stored_image_id = None
-            st.session_state.stored_image_source = None
-            clear_work_state(reset_calibration=True)
+    c_last, c_clear = st.columns(2)
+    if c_last.button("🔁 Загрузить последнее сохранённое"):
+        data_disk, name_disk, fid_disk, path_disk = load_last_image_from_disk()
+        if data_disk and name_disk and fid_disk:
+            st.session_state.stored_image_bytes = data_disk
+            st.session_state.stored_image_name = name_disk
+            st.session_state.stored_image_id = fid_disk
+            st.session_state.stored_image_source = f"disk:{path_disk}"
             st.rerun()
+        else:
+            st.warning("Последнее сохранённое изображение не найдено.")
+    if c_clear.button("🧹 Забыть изображение"):
+        st.session_state.stored_image_bytes = None
+        st.session_state.stored_image_name = None
+        st.session_state.stored_image_id = None
+        st.session_state.stored_image_source = None
+        reset_work(reset_calibration=True, reset_mask_data=True)
+        st.rerun()
 
-        if main_up is None and st.session_state.stored_image_bytes is None and sample.exists():
-            use_sample = st.checkbox("Использовать demo_template.png", value=True)
+    sample = Path(__file__).parent / "sample" / "demo_template.png"
+    use_sample = False
+    if main_up is None and st.session_state.stored_image_bytes is None and sample.exists():
+        use_sample = st.checkbox("Использовать demo_template.png", value=True)
 
-# ════════════════════════════════════════════════════════════════════════
-#  Получение байтов изображения (надёжно для мобильного/Replit)
-# ════════════════════════════════════════════════════════════════════════
-data: Optional[bytes] = None
-src_name: Optional[str] = None
-file_id: Optional[str] = None
-load_note: Optional[str] = None
+img_bgr = None
+src_name = None
+file_id = None
+scale = 1.0
+load_note = None
 
+# 1) Новый upload имеет приоритет. Но на телефоне/Replit иногда getvalue() может вернуть пусто
+#    во время rerun, поэтому пустой upload не должен убивать уже загруженную картинку.
 if main_up is not None:
     try:
         data = main_up.getvalue()
@@ -1096,11 +739,15 @@ if main_up is not None:
     else:
         st.warning("Файл выбран, но браузер не передал данные. Нажмите Browse files ещё раз или используйте последнее сохранённое.")
         st.stop()
+
+# 2) Если upload-компонент после rerun стал None — продолжаем работать с bytes из session_state.
 elif st.session_state.stored_image_bytes:
     data = st.session_state.stored_image_bytes
     src_name = st.session_state.stored_image_name or "stored_image"
     file_id = st.session_state.stored_image_id or file_fingerprint(data, src_name)
     load_note = "из памяти сессии"
+
+# 3) После перезапуска Replit/страницы пробуем поднять последнее изображение с диска.
 else:
     data_disk, name_disk, fid_disk, path_disk = load_last_image_from_disk()
     if data_disk and name_disk and fid_disk:
@@ -1111,22 +758,19 @@ else:
         st.session_state.stored_image_name = name_disk
         st.session_state.stored_image_id = fid_disk
         st.session_state.stored_image_source = f"disk:{path_disk}"
-        st.session_state.last_uploaded_path = path_disk
         load_note = "автовосстановлено из uploads"
-    elif use_sample and sample.exists():
+    elif use_sample:
         data = sample.read_bytes()
         src_name = sample.name
         file_id = remember_image(data, src_name, source="sample")
         load_note = "demo_template"
     else:
-        if fullscreen:
-            st.info("Сначала выключите полноразмерный режим и загрузите изображение.")
-        else:
-            st.info("Загрузите изображение. На телефоне и в Replit надёжнее пользоваться центральной областью загрузки.")
+        st.info("Загрузите изображение. На телефоне и в Replit надёжнее пользоваться центральной областью загрузки.")
         st.stop()
 
 img_bgr, err = decode_image(data, src_name)
 if err or img_bgr is None:
+    # Если текущий upload битый, пробуем последнюю хорошую копию из session_state/disk.
     if st.session_state.stored_image_bytes:
         data = st.session_state.stored_image_bytes
         src_name = st.session_state.stored_image_name or "stored_image"
@@ -1136,178 +780,160 @@ if err or img_bgr is None:
         st.error(err or "Не удалось прочитать изображение.")
         st.stop()
 
-if load_note and not fullscreen:
+if load_note:
     st.caption(f"Источник изображения: {load_note} · размер файла: {len(data) / 1024:.1f} КБ")
 
 orig_h, orig_w = img_bgr.shape[:2]
 
 # ════════════════════════════════════════════════════════════════════════
-#  UI: настройки и режим
+#  UI: настройки работы
 # ════════════════════════════════════════════════════════════════════════
-w_max = max(280, min(2400, int(orig_w)))
-default_w = min(360, w_max)
+fullscreen = st.toggle("🔍 Полноразмерный режим замеров", key="fullscreen_mode")
 
-if fullscreen:
-    # Полноэкранный режим — только выбор режима (минимум элементов)
-    mode = st.radio("Режим", MODES, horizontal=False, key="mode_select")
-    max_w = int(st.session_state.get("work_width_value", default_w))
-    max_w = min(max(280, max_w), w_max)
-else:
-    with st.container(border=True):
-        st.markdown("**2. Настройки и режим**")
-        max_w = st.slider(
-            "Рабочая ширина, px",
-            min_value=280,
-            max_value=w_max,
-            value=min(int(st.session_state.get("work_width_value", default_w)), w_max),
-            step=20,
-            key="work_width_value",
-            help="При изменении ширины ROI сбрасываются, чтобы масштаб не сломался. На телефоне обычно лучше 280–420 px.",
-        )
+with st.container(border=True):
+    st.markdown("**2. Настройки и режим**")
+    w_max = max(280, min(2400, int(orig_w)))
+    # На телефоне фиксированная ширина 820–1200 px часто ломает iframe компонента кликов.
+    # Поэтому дефолт умеренный; при необходимости пользователь может поднять ширину вручную.
+    default_w = min(360, w_max)
+    max_w = st.slider(
+        "Рабочая ширина, px",
+        min_value=280,
+        max_value=w_max,
+        value=default_w,
+        step=20,
+        help="При изменении ширины замеры сбрасываются, чтобы масштаб не сломался. Для телефона обычно лучше 280–420 px. Если холст не появляется, оставьте 360 px.",
+    )
+    ppm_value = float(st.session_state.px_per_mm or 0.0)
+    ppm_in = st.number_input(
+        "px/mm для рабочей картинки",
+        min_value=0.0,
+        value=ppm_value,
+        step=0.5,
+        format="%.4f",
+        help="Можно ввести вручную или откалибровать двумя кликами.",
+    )
+    c_ppm_btn, c_reset_ppm = st.columns(2)
+    if c_ppm_btn.button("Применить px/mm") and ppm_in > 0:
+        st.session_state.px_per_mm = float(ppm_in)
+        st.rerun()
+    if c_reset_ppm.button("Сброс px/mm"):
+        st.session_state.px_per_mm = None
+        st.session_state.calib_pts = []
+        st.rerun()
 
-        st.markdown("**Калибровка (px/mm для рабочей картинки)**")
-        ppm_value = float(st.session_state.px_per_mm or 0.0)
-        cset1, cset2 = st.columns([2, 1])
-        ppm_in = cset1.number_input(
-            "px/mm вручную",
-            min_value=0.0,
-            value=ppm_value,
-            step=0.5,
-            format="%.4f",
-            help="Можно ввести вручную или откалибровать в режиме «Калибровка».",
-        )
-        with cset2:
-            if st.button("Применить px/mm") and ppm_in > 0:
-                st.session_state.px_per_mm = float(ppm_in)
-                st.session_state.calibration_info = {"source": "manual", "px_per_mm": float(ppm_in)}
-                st.session_state.metrics_dirty = True
-                st.rerun()
-            if st.button("Сброс px/mm"):
-                st.session_state.px_per_mm = None
-                st.session_state.calibration_info = None
-                st.session_state.metrics_dirty = True
-                st.rerun()
+    mode = st.radio("Режим", MODES, horizontal=False, key="mode")
 
-        mode = st.radio("Режим", MODES, horizontal=False, key="mode_select")
-
-        if mode == MODE_INCL:
-            st.session_state.inclusion_fast_mode = st.checkbox(
-                "⚡ Быстрый режим включений: клик = точка включения",
-                value=bool(st.session_state.inclusion_fast_mode),
-                help="Включено: каждый клик сразу создаёт ROI-точку. Выключено: точки копятся, затем «Добавить» создаёт их пачкой.",
-            )
-        if mode == MODE_MASK:
-            shape_label = st.radio(
-                "Форма ROI маски",
-                ["Полигон", "Прямоугольник (2 клика)"],
-                horizontal=True,
-            )
-            st.session_state.mask_roi_shape = "rect" if shape_label.startswith("Прямоуг") else "polygon"
-
-# ════════════════════════════════════════════════════════════════════════
-#  Подготовка рабочего изображения + контроль смены изображения
-# ════════════════════════════════════════════════════════════════════════
 work, scale = cached_downscale(img_bgr, int(max_w))
 H, W = work.shape[:2]
+gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
 
-current_image_id = f"{file_id}:{W}x{H}"
-if st.session_state.current_image_id != current_image_id:
-    clear_work_state(reset_calibration=True)
-    st.session_state.current_image_id = current_image_id
-    st.rerun()
+image_state_key = f"{file_id}:{W}x{H}"
+if st.session_state.image_state_key != image_state_key:
+    reset_work(reset_calibration=True, reset_mask_data=True)
+    st.session_state.image_state_key = image_state_key
 
 ppm = st.session_state.px_per_mm
 
-# ════════════════════════════════════════════════════════════════════════
-#  Подсказки и статус
-# ════════════════════════════════════════════════════════════════════════
 hints = {
-    MODE_LINE: "2 точки → «➕ Добавить линию». Длина считается только по «Посчитать метрики».",
-    MODE_CIRCLE: "3 точки на окружности → «➕ Добавить окружность». Радиус/диаметр — по расчёту.",
-    MODE_POLY: "Кликайте вершины (≥3) → «➕ Добавить полигон». Площадь — по расчёту.",
-    MODE_INCL: "Кликайте включения. В быстром режиме каждый клик = точка. Подсчёт — по расчёту.",
-    MODE_MASK: "Очертите область анализа → «➕ Добавить ROI маски». Маска строится отдельной кнопкой.",
-    MODE_CALIB: "2 точки по эталону, длина и единицы ниже → «Применить калибровку».",
+    "Линия / диаметр": "Два клика: начало и конец отрезка.",
+    "Окружность": "Клик 1 — центр, клик 2 — точка на окружности.",
+    "Площадь": "Кликайте вершины контура, затем нажмите «Замкнуть площадь».",
+    "Включения": "Клик по включению добавляет точку в ручной счётчик.",
+    "Калибровка (2 клика)": "Два клика по концам эталона, затем введите известную длину.",
 }
-if not fullscreen:
-    st.markdown(f"<div class='so-hint'>👆 {hints.get(mode, '')}</div>", unsafe_allow_html=True)
+st.markdown(f"<div class='so-hint'>👆 {hints[mode]}</div>", unsafe_allow_html=True)
 
-if st.session_state.cached_metrics is None:
-    metric_state = "не рассчитаны"
-elif st.session_state.metrics_dirty:
-    metric_state = "требуют пересчёта"
+status_text = (
+    f"Файл: {src_name} · оригинал: {orig_w}×{orig_h}px · "
+    f"рабочее: {W}×{H}px · scale={scale:.4f} · "
+    + (f"калибровка: {ppm:.4f} px/mm" if ppm else "калибровка: не задана")
+)
+st.markdown(f"<div class='so-small'>{status_text}</div>", unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════════════════════
+#  UI: центральные кнопки
+# ════════════════════════════════════════════════════════════════════════
+if fullscreen:
+    b1, b2 = st.columns(2)
+    if b1.button("↩️ Отменить точку"):
+        if undo_last_point(mode):
+            st.rerun()
+    if b2.button("↩️ Удалить замер") and st.session_state.meas:
+        st.session_state.meas.pop()
+        st.rerun()
+    b3, b4 = st.columns(2)
+    if b3.button("🗑 Очистить"):
+        reset_work(reset_calibration=False, reset_mask_data=False)
+        st.rerun()
+    debug = b4.checkbox("debug")
 else:
-    metric_state = "актуальны"
-
-dirty_cls = " so-dirty" if (st.session_state.metrics_dirty and st.session_state.cached_metrics is not None) else ""
-st.markdown(
-    f"<div class='so-status{dirty_cls}'>"
-    f"Черновые точки: <b>{len(st.session_state.draft_points)}</b> · "
-    f"ROI накоплено: <b>{len(st.session_state.draft_rois)}</b> · "
-    f"Метрики: <b>{metric_state}</b>"
-    f"{' · калибровка: %.4f px/mm' % ppm if ppm else ' · калибровка: не задана'}"
-    f"</div>",
-    unsafe_allow_html=True,
-)
-
-if not fullscreen:
-    st.markdown(
-        f"<div class='so-small'>Файл: {src_name} · оригинал: {orig_w}×{orig_h}px · "
-        f"рабочее: {W}×{H}px · scale={scale:.4f}</div>",
-        unsafe_allow_html=True,
-    )
+    b1, b2 = st.columns(2)
+    if b1.button("↩️ Отменить точку"):
+        if undo_last_point(mode):
+            st.rerun()
+    if b2.button("Сбросить точки"):
+        st.session_state.pending = []
+        if mode == "Калибровка (2 клика)":
+            st.session_state.calib_pts = []
+        st.rerun()
+    b3, b4 = st.columns(2)
+    if b3.button("↩️ Удалить замер") and st.session_state.meas:
+        st.session_state.meas.pop()
+        st.rerun()
+    if b4.button("🗑 Очистить всё"):
+        reset_work(reset_calibration=False, reset_mask_data=False)
+        st.rerun()
+    debug = st.checkbox("debug")
 
 # ════════════════════════════════════════════════════════════════════════
-#  Холст / клики (общий для обоих режимов)
+#  Холст / клики
 # ════════════════════════════════════════════════════════════════════════
-# Подбираем диапазон ширины кликабельного полотна; в полноэкранном — крупнее.
-cw_max = int(min(1600, max(420, W * (4 if fullscreen else 2))))
-cur_cw = int(st.session_state.get("canvas_display_width", 420))
-cur_cw = max(280, min(cur_cw, cw_max))
-st.session_state.canvas_display_width = cur_cw
-
-canvas_display_width = st.slider(
-    "Ширина кликабельного полотна на экране, px",
-    min_value=280,
-    max_value=cw_max,
-    step=20,
-    key="canvas_display_width",
-    help="Только экранный размер полотна. Расчёты остаются в рабочих пикселях. Если на телефоне холст пропал — уменьшите до 360–520 px.",
-)
-
-# Для живого полотна используем закэшированные метрики (если они актуальны) —
-# это просто подстановка значений в подписи, без какого-либо пересчёта.
-live_meas = None
-if st.session_state.cached_metrics is not None and not st.session_state.metrics_dirty:
-    live_meas = st.session_state.cached_metrics.get("measurements")
-
-overlay = draw_workspace(
+overlay = draw_overlay(
     work,
-    st.session_state.draft_rois,
-    st.session_state.draft_points,
+    st.session_state.meas,
+    st.session_state.pending,
+    st.session_state.inclusions,
+    st.session_state.calib_pts,
+    ppm,
     mode,
-    live_meas,
 )
 
-debug = False
-if not fullscreen:
-    show_control_preview = st.checkbox(
-        "Показать некликабельную контрольную картинку",
-        value=bool(st.session_state.get("show_control_preview_v5", False)),
-        key="show_control_preview_v5",
-        help="Только проверочная картинка. Для замеров кликайте по большому полотну ниже.",
+# В v4 большая картинка — это именно кликабельный canvas.
+# Контрольную st.image оставляем только как дополнительную проверку, чтобы не путать её с полотном замеров.
+if fullscreen:
+    max_canvas_width = min(1200, max(360, int(W * 3)))
+    default_canvas_width = min(760, max(360, int(W * 2)))
+    canvas_display_width = st.slider(
+        "Ширина кликабельного полотна на экране, px",
+        min_value=280,
+        max_value=max_canvas_width,
+        value=int(st.session_state.get("canvas_display_width", default_canvas_width)) if 280 <= int(st.session_state.get("canvas_display_width", default_canvas_width)) <= max_canvas_width else default_canvas_width,
+        step=20,
+        help="Это только экранный размер кликабельного полотна. Расчёты остаются в рабочих пикселях изображения. Если на телефоне холст пропал — уменьшите до 360–520 px.",
+        key="canvas_display_width",
     )
 else:
-    show_control_preview = False
+    canvas_display_width = W
+
+show_control_preview = st.checkbox(
+    "Показать некликабельную контрольную картинку",
+    value=bool(st.session_state.get("show_control_preview_v4", False)),
+    key="show_control_preview_v4",
+    help="Это только проверочная картинка. Для замеров кликайте по большому кликабельному полотну ниже.",
+)
 
 if HAS_CLICK:
     if show_control_preview:
         st.image(
             overlay,
-            caption="Контрольная картинка: клики НЕ принимает. Для замера кликайте по полотну ниже.",
+            caption="Контрольная картинка: она НЕ принимает клики. Для замера кликайте по полотну ниже.",
             use_container_width=True,
         )
 
+    # Делаем отдельную экранную копию canvas.
+    # Это позволяет показать большое кликабельное изображение, но координаты затем
+    # возвращать обратно в рабочую систему W×H.
     canvas_scale = max(1e-9, float(canvas_display_width) / float(W))
     canvas_h = max(1, int(round(H * canvas_scale)))
     if int(canvas_display_width) != W:
@@ -1315,23 +941,37 @@ if HAS_CLICK:
     else:
         canvas_overlay = overlay
 
-    st.caption("Кликабельное полотно для замеров. Клик только добавляет точку/ROI и не запускает расчёт.")
+    st.caption(
+        "Кликабельное полотно для замеров. Большая контрольная картинка выше, если включена, клики не принимает."
+    )
     val = st_imgcoords(
         PILImage.fromarray(canvas_overlay),
         width=int(canvas_display_width),
-        key=f"canvas_v5_{current_image_id}_{mode}_{int(canvas_display_width)}",
+        key=f"canvas_v4_{image_state_key}_{mode}_{int(canvas_display_width)}",
     )
+    if debug:
+        st.write({
+            "component_value": val,
+            "work_size": [W, H],
+            "canvas_size": [int(canvas_display_width), canvas_h],
+            "canvas_scale": canvas_scale,
+            "pending": st.session_state.pending,
+            "calib_pts": st.session_state.calib_pts,
+            "last_click_id": st.session_state.last_click_id,
+        })
     if val is not None and "x" in val and "y" in val:
+        # streamlit-image-coordinates отдаёт координаты клика по отрисованному canvas.
+        # Переводим их в рабочие пиксели исходной уменьшенной картинки.
         raw_x = float(val["x"])
         raw_y = float(val["y"])
         x = int(round(raw_x / canvas_scale))
         y = int(round(raw_y / canvas_scale))
         x, y = clamp_click(x, y, W, H)
         event_time = val.get("timestamp", val.get("time", val.get("event_time", "")))
-        click_id = f"{current_image_id}:{mode}:{x}:{y}:{event_time}:{int(canvas_display_width)}"
+        click_id = f"{image_state_key}:{mode}:{x}:{y}:{event_time}:{int(canvas_display_width)}"
         if click_id != st.session_state.last_click_id:
             st.session_state.last_click_id = click_id
-            handle_click(x, y, mode)  # НЕ считает метрики
+            handle_click(x, y, mode)
             st.rerun()
 else:
     st.warning(
@@ -1346,286 +986,237 @@ else:
         handle_click(int(mx), int(my), mode)
         st.rerun()
 
-# ════════════════════════════════════════════════════════════════════════
-#  Кнопки пакетного режима (общие)
-# ════════════════════════════════════════════════════════════════════════
-add_labels = {
-    MODE_LINE: "➕ Добавить линию",
-    MODE_CIRCLE: "➕ Добавить окружность",
-    MODE_POLY: "➕ Добавить полигон",
-    MODE_INCL: "➕ Добавить точки включений",
-    MODE_MASK: "➕ Добавить ROI маски",
-    MODE_CALIB: "➕ (калибровка — кнопкой ниже)",
-}
-
-ra, rb = st.columns(2)
-if ra.button("↩️ Удалить последнюю точку"):
-    if undo_last_draft_point():
-        st.rerun()
-if rb.button("🧹 Очистить текущие точки"):
-    st.session_state.draft_points = []
-    st.rerun()
-
-rc, rd = st.columns(2)
-if rc.button(add_labels.get(mode, "➕ Добавить ROI"), disabled=(mode == MODE_CALIB)):
-    ok, msg = commit_draft(mode, st.session_state.mask_roi_shape)
-    if ok:
-        st.rerun()
-    else:
-        st.warning(msg)
-if rd.button("🗑 Удалить последний ROI"):
-    if delete_last_roi():
-        st.rerun()
-
-calc_clicked = st.button("✅ Посчитать метрики", type="primary")
-if calc_clicked:
-    run_calculation(work, mode)
-    if fullscreen:
-        st.success("Метрики посчитаны. Выйдите из полноразмерного режима, чтобы увидеть таблицы и экспорт.")
-    else:
-        st.success("Метрики посчитаны.")
-
-if fullscreen:
-    if st.button("⛶ Выйти из полноразмерного режима"):
-        st.session_state.fullscreen_mode = False
-        st.rerun()
+st.caption(
+    f"Текущие точки: {len(st.session_state.pending)} · "
+    f"калибровочные точки: {len(st.session_state.calib_pts)} · "
+    f"замеры: {len(st.session_state.meas)} · включения: {len(st.session_state.inclusions)}"
+)
 
 # ════════════════════════════════════════════════════════════════════════
-#  Калибровка по двум кликам
+#  Действия для площади и калибровки
 # ════════════════════════════════════════════════════════════════════════
-if mode == MODE_CALIB and len(st.session_state.draft_points) == 2:
-    d_px = dist(st.session_state.draft_points[0], st.session_state.draft_points[1])
+if mode == "Площадь":
+    pc1, pc2 = st.columns(2)
+    if pc1.button("✅ Замкнуть площадь"):
+        if len(st.session_state.pending) >= 3:
+            st.session_state.meas.append({"type": "polygon", "pts": list(st.session_state.pending)})
+            st.session_state.pending = []
+            st.rerun()
+        else:
+            st.warning("Нужно минимум 3 точки.")
+    if pc2.button("Сбросить точки площади"):
+        st.session_state.pending = []
+        st.rerun()
+
+if mode == "Калибровка (2 клика)" and len(st.session_state.calib_pts) == 2:
+    d_px = dist(st.session_state.calib_pts[0], st.session_state.calib_pts[1])
     st.info(f"Расстояние между точками: **{d_px:.1f} px**")
-    kc1, kc2, kc3 = st.columns([1, 1, 1])
-    known = kc1.number_input("Длина эталона", min_value=0.0001, value=10.0, step=1.0)
-    units = kc2.selectbox("Единицы", ["mm", "µm"])
-    if kc3.button("Применить калибровку") and known > 0:
-        known_mm = known if units == "mm" else known / 1000.0
-        st.session_state.px_per_mm = d_px / known_mm
-        st.session_state.calibration_info = {
-            "source": "2-click",
-            "known_length": known,
-            "units": units,
-            "known_mm": known_mm,
-            "px_distance": round(d_px, 3),
-            "px_per_mm": st.session_state.px_per_mm,
-        }
-        st.session_state.metrics_dirty = True  # ROI не удаляются, но метрики надо пересчитать
-        st.session_state.draft_points = []
+    kc1, kc2 = st.columns([1, 1])
+    known = kc1.number_input("Известная длина эталона, мм", min_value=0.001, value=10.0, step=1.0)
+    if kc2.button("Применить калибровку") and known > 0:
+        st.session_state.px_per_mm = d_px / known
         st.rerun()
 
 # ════════════════════════════════════════════════════════════════════════
-#  Дальше — только обычный режим (таблицы, маска, экспорт)
+#  Результаты и маска
 # ════════════════════════════════════════════════════════════════════════
-if fullscreen:
-    st.caption("Полноразмерный режим: таблицы, маска и экспорт скрыты. Выйдите из режима, чтобы их увидеть.")
-    st.stop()
+if not fullscreen:
+    res_l, res_r = st.columns([1, 1])
 
-if st.session_state.metrics_dirty and st.session_state.cached_metrics is not None:
-    st.warning("ROI изменены — нужно пересчитать метрики кнопкой «✅ Посчитать метрики».")
-
-# ── Накопленные ROI ──────────────────────────────────────────────────────
-with st.expander(f"🧱 Накопленные ROI ({len(st.session_state.draft_rois)})", expanded=False):
-    if st.session_state.draft_rois:
-        for i, roi in enumerate(st.session_state.draft_rois):
-            cc1, cc2 = st.columns([6, 1])
-            cc1.write(f"{i + 1}. `{roi['id']}` · {roi['type']} · {roi.get('label', '')} · точек: {len(roi['points'])}")
-            if cc2.button("✕", key=f"del_roi_{roi['id']}"):
-                st.session_state.draft_rois.pop(i)
-                st.session_state.metrics_dirty = True
-                st.rerun()
-    else:
-        st.caption("ROI ещё не добавлены. Накопите фигуры и нажмите «Посчитать метрики».")
-
-# ── Результаты расчёта ───────────────────────────────────────────────────
-metrics = st.session_state.cached_metrics
-with st.expander(f"📏 Метрики ({len(st.session_state.measurements)})", expanded=True):
-    if metrics is None:
-        st.caption("Метрики ещё не рассчитаны. Нажмите «✅ Посчитать метрики».")
-    else:
-        for w in metrics.get("warnings", []):
-            st.warning(w)
-        for m in metrics["measurements"]:
-            t = m["type"]
-            if t == "line":
-                txt = f"`{m['id']}` Линия: {m.get('length_px')} px" + (
-                    f" = {m.get('length_mm')} мм" if m.get("length_mm") is not None else ""
-                )
-            elif t == "circle_3pt":
-                txt = f"`{m['id']}` Окружность: D={m.get('diameter_px')} px, S={m.get('area_px2')} px²" + (
-                    f" · D={m.get('diameter_mm')} мм, S={m.get('area_mm2')} мм²" if m.get("diameter_mm") is not None else ""
-                )
-            elif t == "polygon":
-                txt = f"`{m['id']}` Полигон: {m.get('area_px2')} px² ({m.get('n_vertices')} верш.)" + (
-                    f" = {m.get('area_mm2')} мм²" if m.get("area_mm2") is not None else ""
-                )
-            elif t == "inclusion_point":
-                txt = f"`{m['id']}` Включение: ({m.get('x')}, {m.get('y')})"
-            elif t == "mask_roi":
-                txt = f"`{m['id']}` ROI маски: {m.get('roi_area_px2')} px²"
-                if m.get("mask_percent_inside") is not None:
-                    txt += f" · маска внутри: {m.get('mask_percent_inside')}%"
+    with res_l:
+        with st.expander(f"📏 Замеры ({len(st.session_state.meas)})", expanded=True):
+            if st.session_state.meas:
+                for i, m in enumerate(st.session_state.meas):
+                    mm = measure_metrics(m, ppm)
+                    if m["type"] == "line":
+                        txt = f"{i + 1}. Линия: {mm['length_px']} px" + (f" = {mm['length_mm']} мм" if ppm else "")
+                    elif m["type"] == "circle":
+                        txt = f"{i + 1}. Окружность: D={mm['diameter_px']} px, S={mm['area_px2']} px²" + (
+                            f" · D={mm['diameter_mm']} мм, S={mm['area_mm2']} мм²" if ppm else ""
+                        )
+                    else:
+                        txt = f"{i + 1}. Площадь: {mm['area_px2']} px² ({mm['n_vertices']} верш.)" + (
+                            f" = {mm['area_mm2']} мм²" if ppm else ""
+                        )
+                    dc1, dc2 = st.columns([5, 1])
+                    dc1.write(txt)
+                    if dc2.button("✕", key=f"del_meas_{i}"):
+                        st.session_state.meas.pop(i)
+                        st.rerun()
             else:
-                txt = f"`{m['id']}` {t}"
-            st.write(txt)
+                st.caption("Пока нет замеров.")
 
-        st.markdown("**Сводка**")
-        st.json(metrics.get("summary", {}))
-        if metrics.get("statistics"):
-            st.markdown("**Статистика**")
-            st.json(metrics["statistics"])
-
-        if st.session_state.cached_overlay is not None:
-            st.image(st.session_state.cached_overlay, caption="Overlay после расчёта", use_container_width=True)
-
-# ── Маска включений (ленивая) ────────────────────────────────────────────
-with st.expander("🧩 Маска включений (строится только по кнопке)", expanded=False):
-    mask_rois = [r for r in st.session_state.draft_rois if r.get("type") == "mask_roi"]
-    if mask_rois:
-        st.caption(f"Найдено ROI маски: {len(mask_rois)} — маска будет считаться только внутри них.")
-    else:
-        st.caption("ROI маски нет — маска будет считаться по всему рабочему изображению.")
-
-    m1, m2, m3 = st.columns(3)
-    threshold_mode = m1.radio("Порог", ["Otsu", "Manual"], horizontal=True)
-    manual_threshold = m2.slider("Manual threshold", 0, 255, 90, 1)
-    detect_bright = m3.checkbox("Искать светлые, не тёмные", value=False)
-
-    m4, m5, m6, m7 = st.columns(4)
-    min_area = m4.number_input("min area, px²", min_value=1, max_value=1000000, value=4, step=1)
-    max_area = m5.number_input("max area, px² (0 = без лимита)", min_value=0, max_value=10000000, value=0, step=10)
-    blur_size = m6.slider("blur", 1, 15, 3, 2)
-    close_iter = m7.slider("close", 0, 5, 1, 1)
-
-    mb1, mb2 = st.columns(2)
-    if mb1.button("🧩 Построить / обновить маску"):
-        region = _mask_roi_region(work, mask_rois)
-        mask = build_inclusion_mask(
-            work,
-            threshold_mode=threshold_mode,
-            manual_threshold=int(manual_threshold),
-            min_area=int(min_area),
-            max_area=int(max_area),
-            detect_bright=bool(detect_bright),
-            blur_size=int(blur_size),
-            close_iter=int(close_iter),
-            region=region,
-        )
-        st.session_state.mask = mask
-        st.session_state.mask_overlay = make_mask_overlay(work, mask)
-        st.session_state.mask_stats = mask_stats(mask, ppm)
-        st.session_state.mask_settings = {
-            "threshold_mode": threshold_mode,
-            "manual_threshold": int(manual_threshold),
-            "detect_bright": bool(detect_bright),
-            "min_area_px": int(min_area),
-            "max_area_px": int(max_area),
-            "blur_size": int(blur_size),
-            "close_iter": int(close_iter),
-            "restricted_to_mask_roi": region is not None,
-        }
-        # Маска влияет на метрики mask_roi → пометим как dirty
-        if mask_rois:
-            st.session_state.metrics_dirty = True
-        st.rerun()
-    if mb2.button("🗑 Сбросить маску"):
-        reset_mask()
-        st.rerun()
-
-    if st.session_state.mask is not None:
-        st.image(st.session_state.mask_overlay, caption="Overlay маски", use_container_width=True)
-        st.json(st.session_state.mask_stats)
-        md1, md2 = st.columns(2)
-        md1.download_button(
-            "⬇️ Скачать mask.png",
-            gray_png_bytes(st.session_state.mask),
-            file_name=f"mask_{safe_stem(src_name)}.png",
-            mime="image/png",
-        )
-        md2.download_button(
-            "⬇️ Скачать mask_overlay.png",
-            png_bytes(st.session_state.mask_overlay),
-            file_name=f"mask_overlay_{safe_stem(src_name)}.png",
-            mime="image/png",
-        )
-    else:
-        st.caption("Маска ещё не построена.")
-
-# ── Экспорт (после расчёта / по кнопке) ──────────────────────────────────
-st.divider()
-with st.expander("⬇️ Экспорт", expanded=True):
-    if st.session_state.metrics_dirty and st.session_state.cached_metrics is not None:
-        st.warning("ROI изменены — пересчитайте метрики перед экспортом, иначе экспорт устарел.")
-
-    exports = st.session_state.cached_exports
-    if exports is None:
-        st.info("Экспорт станет доступен после нажатия «✅ Посчитать метрики».")
-    else:
-        e1, e2, e3 = st.columns(3)
-        e1.download_button(
-            "🖼 Overlay PNG",
-            exports["overlay_png"],
-            file_name=f"overlay_{safe_stem(src_name)}.png",
-            mime="image/png",
-        )
-        e2.download_button(
-            "⬇️ JSON проекта",
-            exports["json"],
-            file_name=f"project_{safe_stem(src_name)}.json",
-            mime="application/json",
-        )
-        # Excel строим лениво по кнопке (openpyxl импортируется внутри функции).
-        # CSV всегда доступен (готовится при расчёте). Чтобы не было
-        # DuplicateWidgetID, кнопка measurements.csv создаётся ровно один раз.
-        if HAS_XLSX:
-            with e3:
-                if st.button("📊 Собрать Excel"):
-                    xlsx_bytes = build_xlsx_from_metrics(
-                        st.session_state.cached_metrics, exports["project"]
-                    )
-                    st.session_state.cached_exports["xlsx"] = xlsx_bytes
+    with res_r:
+        with st.expander(f"🔴 Включения: {len(st.session_state.inclusions)}", expanded=True):
+            if st.session_state.inclusions:
+                if st.button("🗑 Очистить ручные включения"):
+                    st.session_state.inclusions = []
                     st.rerun()
-                if exports.get("xlsx"):
-                    st.download_button(
-                        "⬇️ measurements.xlsx",
-                        exports["xlsx"],
-                        file_name=f"measurements_{safe_stem(src_name)}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-            # Excel занял колонку e3 — CSV выносим отдельной кнопкой ниже.
-            st.download_button(
-                "⬇️ measurements.csv",
-                exports["csv"],
-                file_name=f"measurements_{safe_stem(src_name)}.csv",
-                mime="text/csv",
+            else:
+                st.caption("Ручной счётчик пуст.")
+
+    with st.expander("🧩 Маска включений / отдача маски", expanded=(mode == "Включения")):
+        st.caption("Маска строится только по кнопке — она не пересчитывается после каждого клика по изображению.")
+        m1, m2, m3 = st.columns(3)
+        threshold_mode = m1.radio("Порог", ["Otsu", "Manual"], horizontal=True)
+        manual_threshold = m2.slider("Manual threshold", 0, 255, 90, 1)
+        detect_bright = m3.checkbox("Искать светлые, не тёмные", value=False)
+
+        m4, m5, m6, m7 = st.columns(4)
+        min_area = m4.number_input("min area, px²", min_value=1, max_value=1000000, value=4, step=1)
+        max_area = m5.number_input("max area, px² (0 = без лимита)", min_value=0, max_value=10000000, value=0, step=10)
+        blur_size = m6.slider("blur", 1, 15, 3, 2)
+        close_iter = m7.slider("close", 0, 5, 1, 1)
+
+        mb1, mb2 = st.columns([1, 1])
+        if mb1.button("🧩 Построить / обновить маску"):
+            mask = build_inclusion_mask(
+                work,
+                threshold_mode=threshold_mode,
+                manual_threshold=manual_threshold,
+                min_area=int(min_area),
+                max_area=int(max_area),
+                detect_bright=detect_bright,
+                blur_size=int(blur_size),
+                close_iter=int(close_iter),
+            )
+            overlay_mask = make_mask_overlay(work, mask)
+            stats = mask_stats(mask, ppm)
+            st.session_state.mask = mask
+            st.session_state.mask_overlay = overlay_mask
+            st.session_state.mask_stats = stats
+            st.session_state.mask_settings = {
+                "threshold_mode": threshold_mode,
+                "manual_threshold": int(manual_threshold),
+                "detect_bright": bool(detect_bright),
+                "min_area_px": int(min_area),
+                "max_area_px": int(max_area),
+                "blur_size": int(blur_size),
+                "close_iter": int(close_iter),
+            }
+            st.rerun()
+        if mb2.button("🗑 Сбросить маску"):
+            reset_mask()
+            st.rerun()
+
+        if st.session_state.mask is not None:
+            st.image(st.session_state.mask_overlay, caption="Overlay маски", use_container_width=True)
+            st.json(st.session_state.mask_stats)
+            md1, md2 = st.columns(2)
+            md1.download_button(
+                "⬇️ Скачать mask.png",
+                gray_png_bytes(st.session_state.mask),
+                file_name=f"mask_{safe_stem(src_name)}.png",
+                mime="image/png",
+            )
+            md2.download_button(
+                "⬇️ Скачать mask_overlay.png",
+                png_bytes(st.session_state.mask_overlay),
+                file_name=f"mask_overlay_{safe_stem(src_name)}.png",
+                mime="image/png",
             )
         else:
-            # openpyxl недоступен — в e3 сразу даём CSV (единственная CSV-кнопка).
-            e3.download_button(
-                "⬇️ measurements.csv",
-                exports["csv"],
-                file_name=f"measurements_{safe_stem(src_name)}.csv",
-                mime="text/csv",
-            )
+            st.caption("Маска ещё не построена.")
+else:
+    st.caption("Полноразмерный режим: результаты и экспорт скрыты, чтобы не занимать экран. Выключите режим, чтобы увидеть таблицы, маску и экспорт.")
 
-        st.markdown("---")
-        st.caption("Проект целиком (изображение как файл, без base64).")
-        if st.button("💾 Собрать проект ZIP"):
-            zip_bytes = build_project_zip(
-                data,
-                src_name,
-                exports["project"],
-                st.session_state.cached_metrics,
-                st.session_state.cached_overlay,
-                st.session_state.mask,
-                st.session_state.mask_overlay,
+# ════════════════════════════════════════════════════════════════════════
+#  Экспорт
+# ════════════════════════════════════════════════════════════════════════
+if not fullscreen:
+    st.divider()
+    with st.expander("⬇️ Экспорт", expanded=True):
+        # Лёгкая сигнатура текущего состояния. Если замеры / включения / калибровка /
+        # маска не менялись, ранее собранные файлы остаются актуальными и не
+        # пересобираются. Тяжёлые операции (PNG/JSON/Excel) выполняются ТОЛЬКО
+        # по кнопке, а не на каждый клик — это и ускоряет работу на Replit free.
+        export_sig = json.dumps(
+            {
+                "meas": st.session_state.meas,
+                "inclusions": st.session_state.inclusions,
+                "ppm": st.session_state.px_per_mm,
+                "mask": st.session_state.mask_stats,
+                "src": src_name,
+                "wh": [W, H],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        cache = st.session_state.export_cache
+        fresh = cache is not None and cache.get("sig") == export_sig
+
+        bcol1, bcol2 = st.columns([3, 2])
+        if bcol1.button("🧮 Подготовить файлы экспорта", type="primary"):
+            mask_info = None
+            if st.session_state.mask_stats is not None:
+                mask_info = {
+                    "stats": st.session_state.mask_stats,
+                    "settings": st.session_state.mask_settings,
+                    "files": ["mask.png", "mask_overlay.png"],
+                }
+            export = build_export(
+                src_name, W, H, ppm, st.session_state.meas, st.session_state.inclusions, scale, mask_info
             )
-            st.session_state.cached_exports["zip"] = zip_bytes
+            annotated = draw_overlay(
+                work,
+                st.session_state.meas,
+                [],
+                st.session_state.inclusions,
+                st.session_state.calib_pts,
+                ppm,
+                mode,
+            )
+            files = {
+                "png": png_bytes(annotated),
+                "json": safe_json(export),
+                "csv": build_csv(export),
+            }
+            if HAS_XLSX:
+                files["xlsx"] = build_xlsx(export)
+            st.session_state.export_cache = {"sig": export_sig, "files": files}
             st.rerun()
-        if exports.get("zip"):
-            st.download_button(
-                "⬇️ Скачать проект ZIP",
-                exports["zip"],
-                file_name=f"metrology_project_{safe_stem(src_name)}.zip",
-                mime="application/zip",
+
+        if cache is None:
+            st.caption(
+                "Нажмите «Подготовить файлы экспорта», чтобы собрать PNG/JSON/Excel. "
+                "Файлы больше не пересобираются после каждого клика — поэтому замеры идут быстрее."
             )
+        else:
+            if not fresh:
+                bcol2.caption("⚠️ Замеры изменились — соберите файлы заново.")
+            files = cache["files"]
+            e1, e2, e3 = st.columns(3)
+            e1.download_button(
+                "🖼 PNG с замерами",
+                files["png"],
+                file_name=f"annotated_{safe_stem(src_name)}.png",
+                mime="image/png",
+            )
+            e2.download_button(
+                "⬇️ JSON",
+                files["json"],
+                file_name=f"measure_{safe_stem(src_name)}.json",
+                mime="application/json",
+            )
+            if "xlsx" in files:
+                e3.download_button(
+                    "⬇️ Excel (.xlsx)",
+                    files["xlsx"],
+                    file_name=f"measure_{safe_stem(src_name)}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                st.download_button(
+                    "⬇️ CSV",
+                    files["csv"],
+                    file_name=f"measure_{safe_stem(src_name)}.csv",
+                    mime="text/csv",
+                    key="csv_extra_download",
+                )
+            else:
+                e3.download_button(
+                    "⬇️ CSV",
+                    files["csv"],
+                    file_name=f"measure_{safe_stem(src_name)}.csv",
+                    mime="text/csv",
+                )
